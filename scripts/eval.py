@@ -78,7 +78,7 @@ def main() -> None:
     polish_renderer(env)
     if target_cfg.target.obstacles.enabled:  # LiDAR view under the scene
       pano = DepthPanorama(env._offline_renderer._model)
-  actor = Actor(obs["actor"].shape[-1], tuple(ckpt["cfg"]["actor_hidden"]), 12).to("cuda:0")
+  actor = Actor(obs["actor"].shape[-1], tuple(ckpt["cfg"]["actor_hidden"]), env.action_manager.total_action_dim).to("cuda:0")
   actor.load_state_dict(ckpt["actor"])
   actor.eval()
 
@@ -112,7 +112,7 @@ def main() -> None:
 
       g = term.ground_under_base()
       base_z = pos[:, 2] - g
-      foot_z = data.site_pos_w[:, foot_ids, 2].max(-1).values - g
+      foot_z = data.site_pos_w[:, foot_ids, 2].max(-1).values - g - target_cfg.target.wheel_radius
       d = gen.dodge_vel[:, :2] / gen.dodge_vel[:, :2].norm(dim=-1, keepdim=True).clamp(min=1e-6)
       side = (vel * torch.stack([-d[:, 1], d[:, 0]], -1)).sum(-1).abs()
       close = term.has_dodge & gen.flying & ((gen.dodge_pos[:, :2] - pos[:, :2]).norm(dim=-1) < 0.8)

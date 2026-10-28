@@ -26,4 +26,4 @@ dev = ["pytest"]
 include = ["go2_supermimic*"]
 
 [tool.setuptools.package-data]
-go2_supermimic = ["robot/go2.xml", "robot/assets/*.obj", "robot/LICENSE_menagerie_go2"]
+go2_supermimic = ["robot/go2.xml", "robot/assets/*.obj", "robot/LICENSE_menagerie_go2", "robot/titatit/mujoco/*.xml", "robot/titatit/meshes_mujoco/*.STL"]

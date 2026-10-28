@@ -246,20 +246,21 @@ class Trainer:
     obs, _ = self.env.reset()
     self.obs = obs["actor"]
     obs_dim = self.obs.shape[-1]
+    self.num_actions = self.env.action_manager.total_action_dim
     self.consts = st.robot_consts(self.env)
     self.ctx = st.ContextReader(self.env)
     self.xi = self.ctx.read()
-    self.enc_bias = self.env.scene["robot"].data.encoder_bias.clone()
+    self.enc_bias = self.env.scene["robot"].data.encoder_bias[:, st.action_joint_ids(self.env)].clone() * self.consts.position_mask
 
-    self.wm = WorldModel(cfg.wm_hidden).to(self.dev)
-    self.actor = Actor(obs_dim, cfg.actor_hidden, st.NUM_JOINTS).to(self.dev)
+    self.wm = WorldModel(cfg.wm_hidden, self.num_actions).to(self.dev)
+    self.actor = Actor(obs_dim, cfg.actor_hidden, self.num_actions).to(self.dev)
     self.opt_wm = torch.optim.Adam(self.wm.parameters(), lr=cfg.lr)
     self.opt_actor = torch.optim.Adam(self.actor.parameters(), lr=cfg.lr, betas=(0.9, 0.95))
 
-    self.buf = ReplayBuffer(cfg.num_envs, cfg.buffer_len, obs_dim, self.dev)
-    self.archive = WindowArchive(cfg.archive_size, cfg.wm_window, st.CONTEXT_DIM, self.dev)
+    self.buf = ReplayBuffer(cfg.num_envs, cfg.buffer_len, obs_dim, self.dev, num_joints=self.num_actions)
+    self.archive = WindowArchive(cfg.archive_size, cfg.wm_window, st.CONTEXT_DIM, self.dev, num_joints=self.num_actions)
     self.explore = torch.arange(cfg.num_envs, device=self.dev) < int(cfg.explore_frac * cfg.num_envs)
-    self.ou = torch.zeros(cfg.num_envs, st.NUM_JOINTS, device=self.dev)
+    self.ou = torch.zeros(cfg.num_envs, self.num_actions, device=self.dev)
     # Imagination uses the env's reward weights, so the two cannot drift apart.
     weights = RewardWeights(**{f.name: env_cfg.rewards[f.name].weight
                                for f in fields(RewardWeights) if f.name in env_cfg.rewards})
@@ -272,6 +273,8 @@ class Trainer:
     self.critic = Critic(self.imag.critic_dim, cfg.critic_hidden).to(self.dev)
     self.opt_critic = torch.optim.Adam(self.critic.parameters(), lr=cfg.lr)
     self.driver = self.expert = None
+    if cfg.driver_policy and self.num_actions != 12:
+      raise ValueError("MoE-CTS driver supports Go2 only; use a TITATIT --expert-policy instead")
     if cfg.driver_policy:
       from go2_supermimic.supermimic.driver import ChaseSteer, MoeCtsDriver
 
@@ -281,9 +284,9 @@ class Trainer:
     if cfg.expert_policy:
       from go2_supermimic.supermimic.driver import ActorDriver
 
-      self.expert = ActorDriver(cfg.expert_policy, obs_dim, self.dev)
+      self.expert = ActorDriver(cfg.expert_policy, obs_dim, self.dev, self.num_actions)
     self.env_index = torch.arange(cfg.num_envs, device=self.dev)
-    self.a_prev = torch.zeros(cfg.num_envs, st.NUM_JOINTS, device=self.dev)
+    self.a_prev = torch.zeros(cfg.num_envs, self.num_actions, device=self.dev)
 
     stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     self.log_dir = Path(cfg.log_root) / f"{stamp}_{cfg.run_name}"
@@ -409,7 +412,7 @@ class Trainer:
       self.obs = obs["actor"]
       self.env_steps += env.num_envs
       for k, v in extras.get("log", {}).items():
-        if k.startswith(("Episode_Reward", "Metrics/target", "Episode_Termination")):  # env logs
+        if k.startswith(("Episode_Reward", "Metrics/target", "Episode_Termination", "Episode_Metrics/penalty/")):  # env logs
           self.ep_stats[k].append(float(v))
 
   def driver_scale(self) -> float:
@@ -432,23 +435,21 @@ class Trainer:
       "relief": b.relief[e, idx[:, :k]],
     }
 
-  @staticmethod
-  def _rarity(w: dict[str, torch.Tensor]) -> torch.Tensor:
+  def _rarity(self, w: dict[str, torch.Tensor]) -> torch.Tensor:
     """Contact changes + flight steps + an early episode end (a fall) per window."""
     s = w["s"]
-    contact = st.feet_world_z(s.reshape(-1, st.STATE_DIM)) < 0.035
+    contact = st.feet_world_z(s.reshape(-1, s.shape[-1]), self.term.cfg.target.wheel_radius) < 0.035
     contact = contact.reshape(s.shape[0], -1, 4).float()
     changes = (contact[:, 1:] - contact[:, :-1]).abs().sum((1, 2))
     airborne = (contact.sum(-1) == 0).float().sum(-1)
     ended = (w["valid"][:, -1] < 0.5).float() * 4.0
     return changes + airborne + ended
 
-  @staticmethod
-  def _archive_worthy(w: dict[str, torch.Tensor]) -> torch.Tensor:
+  def _archive_worthy(self, w: dict[str, torch.Tensor]) -> torch.Tensor:
     """Genuinely rare windows: a flight phase (all feet off for >= 2 steps), a
     hard vertical base motion (take-off / landing impact) or a fall."""
     s = w["s"]
-    feet_z = st.feet_world_z(s.reshape(-1, st.STATE_DIM)).reshape(s.shape[0], -1, 4)
+    feet_z = st.feet_world_z(s.reshape(-1, s.shape[-1]), self.term.cfg.target.wheel_radius).reshape(s.shape[0], -1, 4)
     flight = ((feet_z >= 0.035).all(-1).float().sum(-1)) >= 2
     hard_vz = s[:, :, st.V_YAW][..., 2].abs().amax(-1) > 0.6
     fell = w["valid"][:, -1] < 0.5
@@ -561,6 +562,7 @@ class Trainer:
         "opt_actor": self.opt_actor.state_dict(),
         "opt_critic": self.opt_critic.state_dict(),
         "obs_dim": self.obs.shape[-1],
+        "act_dim": self.num_actions,
       },
       path,
     )

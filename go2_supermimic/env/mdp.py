@@ -113,13 +113,20 @@ def crouch(env: ManagerBasedRlEnv, command_name: str) -> torch.Tensor:
   """Base height below 0.23 m outside of a HIGH-bar duck; use a negative weight."""
   term = _term(env, command_name)
   pos = term.base_local()
-  return collision.crouch_violation(term.gen.state(), pos[:, :2], pos[:, 2])
+  return collision.crouch_violation(term.gen.state(), pos[:, :2], pos[:, 2],
+                                    min_z=term.cfg.target.crouch_min_height)
 
 
 def joint_deviation_l2(env: ManagerBasedRlEnv, entity_name: str = "robot") -> torch.Tensor:
   """Squared joint deviation from the default stance; use a negative weight."""
   d = env.scene[entity_name].data
   return (d.joint_pos - d.default_joint_pos).square().sum(-1)
+
+
+def leg_joint_deviation_l2(env: ManagerBasedRlEnv) -> torch.Tensor:
+  """Position-controlled joints only; cumulative wheel angle is not stance error."""
+  from go2_supermimic.supermimic.state import joint_positions
+  return joint_positions(env).square().sum(-1)
 
 
 def outside_arena(env: ManagerBasedRlEnv, command_name: str, margin: float) -> torch.Tensor:
@@ -143,7 +150,7 @@ def _ground_under(env: ManagerBasedRlEnv, xy: torch.Tensor) -> torch.Tensor:
   return ground(xy, field)
 
 
-def hard_landing(env: ManagerBasedRlEnv, near_ground: float = 0.05,
+def hard_landing(env: ManagerBasedRlEnv, near_ground: float = 0.05, foot_radius: float = 0.0,
                  entity_name: str = "robot") -> torch.Tensor:
   """Squared downward base speed while a foot is near the ground (absorb the
   landing instead of slamming); use a negative weight. Foot heights are taken
@@ -152,7 +159,7 @@ def hard_landing(env: ManagerBasedRlEnv, near_ground: float = 0.05,
   g = _ground_under(env, robot.data.root_link_pos_w[:, :2])
   feet_z = (limb_positions_w(robot)["feet"][..., 2] - g.unsqueeze(-1)).min(-1).values
   vz = robot.data.root_link_lin_vel_w[:, 2]
-  return (-vz).clamp(min=0.0).square() * (feet_z < near_ground).float()
+  return (-vz).clamp(min=0.0).square() * (feet_z - foot_radius < near_ground).float()
 
 
 def upright(env: ManagerBasedRlEnv, std: float, entity_name: str = "robot") -> torch.Tensor:
@@ -161,10 +168,12 @@ def upright(env: ManagerBasedRlEnv, std: float, entity_name: str = "robot") -> t
 
 
 def base_height_low(
-  env: ManagerBasedRlEnv, min_height: float, entity_name: str = "robot"
+  env: ManagerBasedRlEnv, min_height: float | None = None, entity_name: str = "robot"
 ) -> torch.Tensor:
   """How far the base is below min_height (above the ground under it); use a
   negative weight."""
+  if min_height is None:
+    min_height = _term(env, "target").cfg.target.base_min_height
   pos = env.scene[entity_name].data.root_link_pos_w
   z = pos[:, 2] - _ground_under(env, pos[:, :2])
   return (min_height - z).clamp(min=0.0)
@@ -195,3 +204,27 @@ def terrain_levels_by_progress(env: ManagerBasedRlEnv, env_ids: torch.Tensor,
   terrain.terrain_levels[env_ids] = levels
   terrain.env_origins[env_ids] = terrain.terrain_origins[levels, terrain.terrain_types[env_ids]]
   return {"max_level": torch.tensor(float(top))}
+
+
+def joint_penalty_contribution(env, reward_name: str, action_term: str, asset_cfg):
+  """Weighted contribution per policy step, for logging only (legs or wheels)."""
+  from mjlab.envs import mdp as envs_mdp
+
+  if reward_name == "action_rate_l2":
+    offset = 0
+    for name in env.action_manager.active_terms:
+      dim = env.action_manager.get_term(name).action_dim
+      if name == action_term:
+        delta = env.action_manager.action[:, offset:offset + dim] - env.action_manager.prev_action[:, offset:offset + dim]
+        value = delta.square().sum(-1)
+        break
+      offset += dim
+    else:
+      raise KeyError(action_term)
+  elif reward_name == "joint_acc_l2":
+    value = envs_mdp.joint_acc_l2(env, asset_cfg)
+  elif reward_name == "joint_torques_l2":
+    value = envs_mdp.joint_torques_l2(env, asset_cfg)
+  else:
+    raise ValueError(reward_name)
+  return value * env.cfg.rewards[reward_name].weight * env.step_dt

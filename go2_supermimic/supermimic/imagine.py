@@ -103,7 +103,8 @@ class Imagination:
     self.terms = terms
     self.use_scan = any(name == "height_scan" for name, _ in terms)
     self.use_obst = target_cfg.obstacles.enabled
-    self.critic_dim = (CRITIC_DIM + (tr.SCAN_POINTS if self.use_scan else 0)
+    self.layout = st.StateLayout(consts.default_q.shape[-1])
+    self.critic_dim = (CRITIC_DIM + self.layout.state_dim - st.STATE_DIM + (tr.SCAN_POINTS if self.use_scan else 0)
                        + (target_cfg.obstacles.lidar_rays if self.use_obst else 0))
     self.c = consts
     self.target_cfg = target_cfg
@@ -125,15 +126,19 @@ class Imagination:
     dist = rel.norm(dim=-1).clamp(min=1e-6)
     u = rel / dist.unsqueeze(-1)
     toward = (v_w * u).sum(-1)
-    geom = robot_geometry(pose1[:, :2], s1[:, 0], yaw, st.limb_points_world(s1, pose1))
+    geom = robot_geometry(pose1[:, :2], s1[:, 0], yaw, st.limb_points_world(s1, pose1), self.target_cfg)
     clearance = dodge_clearance(gst, geom, self.target_cfg)
     ahead = predicted_clearance(gst, geom, self.target_cfg)
     feet_min = geom["feet"][..., 2].min(-1).values
 
-    q = s1[:, st.Q] + k["default_q"]
+    q = s1[:, self.layout.q] + k["default_q"]
     lim = k["soft_limits"]
-    q_target = a * k["action_scale"] + k["default_q"]
-    tau = (c.kp * (q_target - q) - c.kd * s1[:, st.QD]).clamp(-c.effort, c.effort)
+    pos_mask = c.position_mask if c.position_mask is not None else torch.ones_like(c.kp, dtype=torch.bool)
+    target = a * k["action_scale"]
+    q_target = target + k["default_q"]
+    vel_target = torch.zeros_like(target) if c.velocity_limit is None else target.clamp(-c.velocity_limit, c.velocity_limit)
+    vel_target = torch.where(pos_mask, 0.0, vel_target)
+    tau = (c.kp * (q_target - q) + c.kd * (vel_target - s1[:, self.layout.qd])).clamp(-c.effort, c.effort)
     g = s1[:, st.GRAV]
     r_arena = (pose1[:, :2] - gst["center"]).norm(dim=-1)
 
@@ -149,19 +154,20 @@ class Imagination:
       "obstacle_contact": obstacle_penetration(geom, gst["obst"]),
       "upright": torch.exp(-(g[:, :2].square().sum(-1)) / 0.4**2),
       "tilt_rate_l2": s1[:, st.W_B][:, :2].square().sum(-1),
-      "hard_landing": (-s1[:, 6]).clamp(min=0.0).square() * (feet_min < 0.05).float(),
-      "crouch": crouch_violation(gst, pose1[:, :2], s1[:, 0]),
-      "joint_deviation_l2": s1[:, st.Q].square().sum(-1),
-      "base_height_low": (0.18 - s1[:, 0]).clamp(min=0.0),
+      "hard_landing": (-s1[:, 6]).clamp(min=0.0).square() * (feet_min - self.target_cfg.wheel_radius < 0.05).float(),
+      "crouch": crouch_violation(gst, pose1[:, :2], s1[:, 0], min_z=self.target_cfg.crouch_min_height),
+      "joint_deviation_l2": (s1[:, self.layout.q] * pos_mask).square().sum(-1),
+      "base_height_low": (self.target_cfg.base_min_height - s1[:, 0]).clamp(min=0.0),
       "action_rate_l2": (a - a_prev).square().sum(-1),
-      "dof_pos_limits": ((lim[..., 0] - q).clamp(min=0) + (q - lim[..., 1]).clamp(min=0)).sum(-1),
+      "dof_pos_limits": (((lim[..., 0] - q).clamp(min=0) + (q - lim[..., 1]).clamp(min=0)) * pos_mask).sum(-1),
       "joint_torques_l2": tau.square().sum(-1),
-      "joint_acc_l2": ((s1[:, st.QD] - s0[:, st.QD]) / cfg.dt).square().sum(-1),
+      "joint_acc_l2": ((s1[:, self.layout.qd] - s0[:, self.layout.qd]) / cfg.dt).square().sum(-1),
     }
     total = sum(getattr(w, name) * v for name, v in terms.items())
     # Annealed jump/duck hint; its weight is a tensor so changing it does not
     # trigger torch.compile recompilation.
-    terms["dodge_hint"] = dodge_shaping(gst, pose1[:, :2], s1[:, 0], st.feet_world_z(s1))
+    terms["dodge_hint"] = dodge_shaping(gst, pose1[:, :2], s1[:, 0], st.feet_world_z(s1, self.target_cfg.wheel_radius),
+                                         stand_height=self.target_cfg.stand_height)
     total = total + k["hint_weight"] * terms["dodge_hint"]
     return total * cfg.dt, terms
 
@@ -229,6 +235,10 @@ class Imagination:
     tgt = oracle_observation(gst, base, yaw)
     lidar = self.lidar(pose_next, gst, cfg.sensor_grad) if self.use_obst else None
     scan = self.scan(s_next, pose_next, gst, cfg.sensor_grad) if self.use_scan else None
+    if self.c.position_mask is not None:
+      # Wheel angle is unobservable and unpenalized; keep its imagined slot zero.
+      s_next = torch.cat([s_next[:, :10], s_next[:, self.layout.q] * self.c.position_mask,
+                          s_next[:, self.layout.q.stop:]], -1)
     frame = st.obs_frame(s_next, a, tgt, enc_bias, noise=True, lidar=lidar, height_scan=scan)
     hist = st.push_history(hist, frame, self.h, self.terms)
     return s_next, pose_next, a, hist, gst, r, d, crit_in

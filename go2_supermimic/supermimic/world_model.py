@@ -55,10 +55,11 @@ class WorldModel(nn.Module):
   of the local ground grid (terrain and obstacles, see target/terrain.py), so
   stepping onto a stair or pushing into a wall is predictable."""
 
-  def __init__(self, hidden: tuple[int, ...] = (1024, 1024, 1024)):
+  def __init__(self, hidden: tuple[int, ...] = (1024, 1024, 1024), num_joints: int = 12):
     super().__init__()
-    in_dim = st.STATE_DIM + 2 * st.NUM_JOINTS + st.CONTEXT_DIM + SCAN_POINTS
-    out_dim = st.STATE_DIM + st.POSE_DELTA_DIM
+    self.state_dim = st.StateLayout(num_joints).state_dim
+    in_dim = self.state_dim + 2 * num_joints + st.CONTEXT_DIM + SCAN_POINTS
+    out_dim = self.state_dim + st.POSE_DELTA_DIM
     self.net = mlp(in_dim, hidden, out_dim)
     self.in_norm = RunningNorm(in_dim)
     # Normalizes the per-step change of s and the pose delta.
@@ -76,7 +77,7 @@ class WorldModel(nn.Module):
     """relief (B, P): ground under the base minus the ground at each scan point.
     Returns (s_next, pose_delta)."""
     y = self.out_norm.unnormalize(self.net(self.in_norm(self._inputs(s, a, a_prev, xi, relief))))
-    return s + y[:, : st.STATE_DIM], y[:, st.STATE_DIM :]
+    return s + y[:, : self.state_dim], y[:, self.state_dim :]
 
   def loss(self, s0, actions, actions_prev, xi, reliefs, s_targets, pose_targets, valid):
     """k-step autoregressive loss in normalized output units.

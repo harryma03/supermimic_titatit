@@ -89,13 +89,13 @@ class ActorDriver:
   observation must be a prefix of the env's (true when the task only appends
   terms, like the terrain height scan)."""
 
-  def __init__(self, path: str, env_obs_dim: int, device):
+  def __init__(self, path: str, env_obs_dim: int, device, act_dim: int = 12):
     from go2_supermimic.supermimic.train import Actor
 
     ck = torch.load(path, map_location=device, weights_only=False)
     self.obs_dim = ck["obs_dim"]
     assert self.obs_dim <= env_obs_dim, (self.obs_dim, env_obs_dim)
-    self.actor = Actor(self.obs_dim, tuple(ck["cfg"]["actor_hidden"]), 12).to(device)
+    self.actor = Actor(self.obs_dim, tuple(ck["cfg"]["actor_hidden"]), act_dim).to(device)
     self.actor.load_state_dict(ck["actor"])
     self.actor.eval()
 

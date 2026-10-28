@@ -4,10 +4,10 @@ Defines the world-model state, the sim context xi, the robot planar pose, and
 an exact re-implementation of the actor observation so that a policy trained
 in imagination can be evaluated (and deployed) in the real env unchanged.
 
-World-model state s (70):
+World-model state s (70 for Go2, 78 for TITATIT):
   base height (1), gravity in body frame (3), base linear velocity in the yaw
-  frame (3), base angular velocity in body frame (3), joint pos - default (12),
-  joint vel (12), then hip, knee and foot positions relative to the base in the
+  frame (3), base angular velocity in body frame (3), joint pos - default (J),
+  joint vel (J), J=12 or 16; both are ordered by action terms, then hip, knee and foot positions relative to the base in the
   yaw frame (3 x 4 x 3, legs ordered FR FL RR RL). The limb points make contact
   changes (touchdown / liftoff) explicit and let imagination compute per-leg
   collisions with obstacles exactly as the env does.
@@ -48,9 +48,53 @@ KNEE_BODIES = tuple(f"{leg}_calf" for leg in LEGS)  # calf frame = knee joint
 FOOT_RADIUS = 0.022
 
 
-def feet_world_z(s: torch.Tensor) -> torch.Tensor:
+@dataclass(frozen=True)
+class StateLayout:
+  """Per-robot slices; the last 36 values always describe the four limbs."""
+  num_joints: int = 12
+
+  @property
+  def state_dim(self):
+    return 46 + 2 * self.num_joints
+
+  @property
+  def q(self):
+    return slice(10, 10 + self.num_joints)
+
+  @property
+  def qd(self):
+    return slice(10 + self.num_joints, 10 + 2 * self.num_joints)
+
+
+def action_joint_ids(env):
+  return torch.cat([env.action_manager.get_term(name)._target_ids
+                    for name in env.action_manager.active_terms])
+
+
+def position_mask(env):
+  from mjlab.envs.mdp.actions import JointPositionActionCfg
+  return torch.cat([torch.full((env.action_manager.get_term(name).action_dim,),
+                    isinstance(env.action_manager.get_term(name).cfg, JointPositionActionCfg),
+                    device=env.device, dtype=torch.bool)
+                    for name in env.action_manager.active_terms])
+
+
+def joint_positions(env, biased=False):
+  d = env.scene["robot"].data
+  ids = action_joint_ids(env)
+  q = d.joint_pos - d.default_joint_pos
+  if biased:
+    q = q + d.encoder_bias
+  return q[:, ids] * position_mask(env)
+
+
+def joint_velocities(env):
+  return env.scene["robot"].data.joint_vel[:, action_joint_ids(env)]
+
+
+def feet_world_z(s: torch.Tensor, radius: float = 0.0) -> torch.Tensor:
   """World-frame foot site heights (N, 4) from the state (yaw rotation keeps z)."""
-  return s[:, Z] + s[:, FEET].reshape(-1, 4, 3)[..., 2]
+  return s[:, Z] + s[:, -12:].reshape(-1, 4, 3)[..., 2] - radius
 
 
 def limb_points_world(s: torch.Tensor, pose: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -59,7 +103,7 @@ def limb_points_world(s: torch.Tensor, pose: torch.Tensor) -> dict[str, torch.Te
   c, si = pose[:, 2].cos(), pose[:, 2].sin()
   base = torch.cat([pose[:, :2], s[:, Z]], -1).unsqueeze(1)
   out = {}
-  for name, sl in (("hips", HIPS), ("knees", KNEES), ("feet", FEET)):
+  for name, sl in (("hips", slice(-36, -24)), ("knees", slice(-24, -12)), ("feet", slice(-12, None))):
     rel = s[:, sl].reshape(-1, 4, 3)
     x = c.unsqueeze(-1) * rel[..., 0] - si.unsqueeze(-1) * rel[..., 1]
     y = si.unsqueeze(-1) * rel[..., 0] + c.unsqueeze(-1) * rel[..., 1]
@@ -91,7 +135,8 @@ def obs_terms(env_cfg) -> tuple[tuple[str, int], ...]:
   """Actor terms (name, per-frame dim) of an env config, in order."""
   names = list(env_cfg.observations["actor"].terms)
   rays = env_cfg.commands["target"].target.obstacles.lidar_rays
-  known = dict(OBS_TERMS) | {"lidar": rays, "height_scan": SCAN_POINTS}
+  n = 16 if "wheel_vel" in env_cfg.actions else 12
+  known = dict(OBS_TERMS) | {"joint_pos": n, "joint_vel": n, "actions": n} | {"lidar": rays, "height_scan": SCAN_POINTS}
   terms = tuple((n, known[n]) for n in names)
   assert [n for n, _ in terms[: len(OBS_TERMS)]] == [n for n, _ in OBS_TERMS], names
   return terms
@@ -99,22 +144,24 @@ def obs_terms(env_cfg) -> tuple[tuple[str, int], ...]:
 
 @dataclass
 class RobotConsts:
-  """Per-env constants of the robot and action mapping (all (N, 12) unless noted)."""
+  """Per-env constants in action order, J=12 for Go2 or 16 for TITATIT."""
 
   default_q: torch.Tensor
   action_scale: torch.Tensor
-  kp: torch.Tensor  # (12,)
-  kd: torch.Tensor  # (12,)
-  effort: torch.Tensor  # (12,)
-  soft_limits: torch.Tensor  # (N, 12, 2)
+  kp: torch.Tensor  # (J,)
+  kd: torch.Tensor  # (J,)
+  effort: torch.Tensor  # (J,)
+  soft_limits: torch.Tensor  # (N, J, 2)
+  position_mask: torch.Tensor | None = None
+  velocity_limit: torch.Tensor | None = None
 
 
 def robot_consts(env) -> RobotConsts:
   robot = env.scene["robot"]
-  term = env.action_manager.get_term("joint_pos")
-  jids = term._target_ids
-  names = term._target_names
-  assert jids.tolist() == list(range(NUM_JOINTS)), "expect actions in joint order"
+  terms = [env.action_manager.get_term(name) for name in env.action_manager.active_terms]
+  jids = action_joint_ids(env)
+  names = [name for term in terms for name in term._target_names]
+  assert sorted(jids.tolist()) == list(range(len(robot.joint_names))), "actions must cover every joint once"
   kp, kd, eff = [], [], []
   for n in names:
     for act in robot.cfg.articulation.actuators:
@@ -126,16 +173,20 @@ def robot_consts(env) -> RobotConsts:
     else:
       raise KeyError(f"no actuator for joint {n}")
   dev = env.device
-  scale = term._scale
-  if not torch.is_tensor(scale):
-    scale = torch.full((env.num_envs, NUM_JOINTS), float(scale), device=dev)
+  scales, limits = [], []
+  for term in terms:
+    scale = term._scale
+    if not torch.is_tensor(scale):
+      scale = torch.full((env.num_envs, term.action_dim), float(scale), device=dev)
+    scales.append(scale)
+    limits.extend([term.cfg.clip[".*"][1] if term.cfg.clip else float("inf")] * term.action_dim)
   return RobotConsts(
-    default_q=robot.data.default_joint_pos.clone(),
-    action_scale=scale.clone(),
-    kp=torch.tensor(kp, device=dev),
-    kd=torch.tensor(kd, device=dev),
+    default_q=robot.data.default_joint_pos[:, jids].clone(),
+    action_scale=torch.cat(scales, -1),
+    kp=torch.tensor(kp, device=dev), kd=torch.tensor(kd, device=dev),
     effort=torch.tensor(eff, device=dev),
-    soft_limits=robot.data.soft_joint_pos_limits.clone(),
+    soft_limits=robot.data.soft_joint_pos_limits[:, jids].clone(),
+    position_mask=position_mask(env), velocity_limit=torch.tensor(limits, device=dev),
   )
 
 
@@ -175,8 +226,8 @@ def robot_state(env, field=None) -> torch.Tensor:
       d.projected_gravity_b,
       v_yaw,
       d.root_link_ang_vel_b,
-      d.joint_pos - d.default_joint_pos,
-      d.joint_vel,
+      joint_positions(env),
+      joint_velocities(env),
     ] + [r.reshape(-1, 12) for r in rel],
     dim=-1,
   )
@@ -240,11 +291,12 @@ def obs_frame(
   height_scan: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
   """One frame of each actor observation term, computed from the model state."""
+  layout = StateLayout(last_action.shape[-1])
   frame = {
     "base_ang_vel": s[:, W_B],
     "projected_gravity": s[:, GRAV],
-    "joint_pos": s[:, Q] + encoder_bias,
-    "joint_vel": s[:, QD],
+    "joint_pos": s[:, layout.q] + encoder_bias,
+    "joint_vel": s[:, layout.qd],
     "actions": last_action,
     "target": target_obs,
   }

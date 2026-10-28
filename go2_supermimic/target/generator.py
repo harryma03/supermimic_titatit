@@ -96,6 +96,13 @@ class BallTargetCfg:
   tag_sigma: float = 0.3
   """Width of the Gaussian tag reward; its gradient covers the last ~0.6 m, the
   approach-speed reward guides from further away [m]."""
+  stand_height: float = 0.27
+  crouch_min_height: float = 0.23
+  base_min_height: float = 0.18
+  trunk_bounds: tuple[float, ...] = (-0.25, 0.38, -0.10, 0.10, -0.06, 0.08)
+  thigh_radius: float = 0.035
+  calf_radius: float = 0.025
+  wheel_radius: float = 0.0  # zero for point-foot robots
   head_offset: float = 0.33
   """Head position ahead of the base along the heading [m]."""
   escape_speed: tuple[float, float] = (3.0, 4.0)

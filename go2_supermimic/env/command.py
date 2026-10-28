@@ -144,7 +144,7 @@ class TargetCommand(CommandTerm):
     lift = torch.stack([torch.zeros_like(g), torch.zeros_like(g), g], -1)[:, None]
     limbs = {k: v - lift for k, v in limb_positions_w(self.robot).items()}
     return robot_geometry(data.root_link_pos_w[:, :2], data.root_link_pos_w[:, 2] - g,
-                          data.heading_w, limbs)
+                          data.heading_w, limbs, self.cfg.target)
 
   def body_clearance(self) -> torch.Tensor:
     """Gap between the dodge obstacle and the robot (<= 0 means touching)."""

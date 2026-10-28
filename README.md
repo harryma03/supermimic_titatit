@@ -14,9 +14,10 @@ through imagined rollouts) on [mjlab](https://github.com/mujocolab/mjlab) (MuJoC
 
 ## 📖 Overview
 
-| Flat | Obstacles | Terrain |
-|:---:|:---:|:---:|
-| <img src="resources/flat.gif" width="280"/> | <img src="resources/obstacles.gif" width="280"/> | <img src="resources/terrain.gif" width="280"/> |
+
+|       Flat       |       Obstacles       |       Terrain       |
+| :----------------: | :---------------------: | :-------------------: |
+|                  |                      |                    |
 | `Go2-Chase-Flat` | `Go2-Chase-Obstacles` | `Go2-Chase-Terrain` |
 
 Every task combines the same two games:
@@ -27,11 +28,12 @@ Every task combines the same two games:
   wind-up: high, mid and low **balls** (duck, sidestep, lift a leg), **low bars** to jump over
   and **high bars** to duck under.
 
-| Task | Scene | Extra robot input | Episode modes | Thrown |
-|---|---|---|---|---|
-| `Go2-Chase-Flat` | open flat ground | – | chase / dodge / both (30 / 30 / 40 %) | balls + bars |
-| `Go2-Chase-Obstacles` | tall boxes, pillars and walls, placed per episode | 16-ray planar LiDAR | chase / dodge / both (30 / 30 / 40 %) | balls + bars (slower) |
-| `Go2-Chase-Terrain` | pyramid stairs up and down, box grids, rough ground, slopes; 5 difficulty rows | 11 × 7 height scan | chase / chase + dodge (60 / 40 %) | bars |
+
+| Task                  | Scene                                                                          | Extra robot input   | Episode modes                         | Thrown                |
+| ----------------------- | -------------------------------------------------------------------------------- | --------------------- | --------------------------------------- | ----------------------- |
+| `Go2-Chase-Flat`      | open flat ground                                                               | –                  | chase / dodge / both (30 / 30 / 40 %) | balls + bars          |
+| `Go2-Chase-Obstacles` | tall boxes, pillars and walls, placed per episode                              | 16-ray planar LiDAR | chase / dodge / both (30 / 30 / 40 %) | balls + bars (slower) |
+| `Go2-Chase-Terrain`   | pyramid stairs up and down, box grids, rough ground, slopes; 5 difficulty rows | 11 × 7 height scan | chase / chase + dodge (60 / 40 %)     | bars                  |
 
 Among obstacles the chase ball slides along them and throws wait for a clear line to the robot.
 On terrain, steps grow from 2 to 10 cm and box edges from 2 to 8 cm; harder rows open during
@@ -57,11 +59,12 @@ python scripts/eval.py Go2-Chase-Terrain --checkpoint weights/terrain.pt --terra
 `weights/` holds the actor of each task (policy only; enough for `scripts/eval.py`, not for
 resuming training, which also needs the world model and critic).
 
-| file | task | inputs |
-|---|---|---|
-| `flat.pt` | `Go2-Chase-Flat` | 350 |
-| `obstacles.pt` | `Go2-Chase-Obstacles` | 430 |
-| `terrain.pt` | `Go2-Chase-Terrain` | 735 |
+
+| file           | task                  | inputs |
+| ---------------- | ----------------------- | -------- |
+| `flat.pt`      | `Go2-Chase-Flat`      | 350    |
+| `obstacles.pt` | `Go2-Chase-Obstacles` | 430    |
+| `terrain.pt`   | `Go2-Chase-Terrain`   | 735    |
 
 ### Train
 
@@ -139,16 +142,17 @@ control at 50 Hz). Checkpoints hold `actor`, `critic`, `world_model` and the tra
 
 **Actor observation**, 5 frames of history, each term stacked oldest → newest:
 
-| term | per frame | notes |
-|---|---|---|
-| base angular velocity | 3 | IMU, body frame |
-| projected gravity | 3 | body frame |
-| joint positions − default | 12 | with a per-episode encoder bias |
-| joint velocities | 12 | |
-| last action | 12 | |
-| target | 28 | the two slots below |
-| LiDAR | 16 | obstacles task only; ranges to 4 m |
-| height scan | 77 | terrain task only; base height above an 11 × 7 grid, 12 cm spacing |
+
+| term                       | per frame | notes                                                               |
+| ---------------------------- | ----------- | --------------------------------------------------------------------- |
+| base angular velocity      | 3         | IMU, body frame                                                     |
+| projected gravity          | 3         | body frame                                                          |
+| joint positions − default | 12        | with a per-episode encoder bias                                     |
+| joint velocities           | 12        |                                                                     |
+| last action                | 12        |                                                                     |
+| target                     | 28        | the two slots below                                                 |
+| LiDAR                      | 16        | obstacles task only; ranges to 4 m                                  |
+| height scan                | 77        | terrain task only; base height above an 11 × 7 grid, 12 cm spacing |
 
 Total: 350 (flat), 430 (obstacles), 735 (terrain) inputs. No linear velocity: it is not
 measured on the robot.
@@ -158,13 +162,14 @@ about the balls: two slots, CHASE then DODGE, in the robot yaw frame. In simulat
 filled from ground truth (`oracle_observation`); on the robot a perception stack must fill the
 same layout.
 
-| per slot (14) | meaning |
-|---|---|
-| `p` (3), `v` (3) | object position relative to the base and its velocity, yaw frame |
-| `sigma` (3) | 1-σ position uncertainty (0 for the oracle) |
-| `visible`, `age` | measured this step; seconds since the last measurement |
-| `is_bar`, `half_len` | bar or ball; bar half length |
-| `active` | the object is in play (an inactive slot is all zeros) |
+
+| per slot (14)        | meaning                                                          |
+| ---------------------- | ------------------------------------------------------------------ |
+| `p` (3), `v` (3)     | object position relative to the base and its velocity, yaw frame |
+| `sigma` (3)          | 1-σ position uncertainty (0 for the oracle)                     |
+| `visible`, `age`     | measured this step; seconds since the last measurement           |
+| `is_bar`, `half_len` | bar or ball; bar half length                                     |
+| `active`             | the object is in play (an inactive slot is all zeros)            |
 
 ## 📦 Package layout
 
@@ -231,3 +236,7 @@ This repository re-implements the training method of SuperMimic; please cite the
 MIT (see [LICENSE](LICENSE)). The Go2 model and meshes in `go2_supermimic/robot/` come from
 MuJoCo Menagerie and keep their own license
 ([LICENSE_menagerie_go2](go2_supermimic/robot/LICENSE_menagerie_go2)).
+
+## TITATIT 四轮足任务
+
+新增 `Titatit-Chase-Flat`、`Titatit-Chase-Obstacles`、`Titatit-Chase-Terrain`，复用上述三种场景，使用 12 腿位置动作 + 4 轮速度动作。控制参数、动作顺序、训练和评估命令见 [TITATIT 说明](docs/titatit.md)。现有 Go2 预训练权重不适用于 TITATIT，需重新训练。

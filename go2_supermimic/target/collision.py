@@ -44,9 +44,13 @@ STAND_HEIGHT = 0.27
 BAR_SAMPLES = 9
 
 
-def robot_geometry(base_xy, base_z, yaw, limbs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+def robot_geometry(base_xy, base_z, yaw, limbs: dict[str, torch.Tensor], cfg: BallTargetCfg | None = None) -> dict[str, torch.Tensor]:
   """Bundle what the collision model needs; limbs: world hips/knees/feet (N, 4, 3)."""
-  return {"base_xy": base_xy, "base_z": base_z, "yaw": yaw, **limbs}
+  g = {"base_xy": base_xy, "base_z": base_z, "yaw": yaw, **limbs}
+  if cfg is not None:
+    g.update(bounds=cfg.trunk_bounds, thigh_radius=cfg.thigh_radius,
+             calf_radius=cfg.calf_radius, wheel_radius=cfg.wheel_radius)
+  return g
 
 
 def _trunk_distance(point, g) -> torch.Tensor:
@@ -57,9 +61,10 @@ def _trunk_distance(point, g) -> torch.Tensor:
   x = c * dx_w + s * dy_w
   y = -s * dx_w + c * dy_w
   z = point[..., 2] - g["base_z"]
-  ex = (TRUNK_X[0] - x).clamp(min=0) + (x - TRUNK_X[1]).clamp(min=0)
-  ey = (TRUNK_Y[0] - y).clamp(min=0) + (y - TRUNK_Y[1]).clamp(min=0)
-  ez = (-TRUNK_BELOW_BASE - z).clamp(min=0) + (z - TRUNK_ABOVE_BASE).clamp(min=0)
+  xmin, xmax, ymin, ymax, zmin, zmax = g.get("bounds", (*TRUNK_X, *TRUNK_Y, -TRUNK_BELOW_BASE, TRUNK_ABOVE_BASE))
+  ex = (xmin - x).clamp(min=0) + (x - xmax).clamp(min=0)
+  ey = (ymin - y).clamp(min=0) + (y - ymax).clamp(min=0)
+  ez = (zmin - z).clamp(min=0) + (z - zmax).clamp(min=0)
   return torch.sqrt(ex**2 + ey**2 + ez**2 + 1e-8)
 
 
@@ -86,11 +91,15 @@ def robot_clearance(point: torch.Tensor, radius: float, g: dict[str, torch.Tenso
   parts = torch.cat(
     [
       _trunk_distance(point, g).unsqueeze(-1),
-      _segment_distance(point, g["hips"], g["knees"]) - THIGH_RADIUS,
-      _segment_distance(point, g["knees"], g["feet"]) - CALF_RADIUS,
+      _segment_distance(point, g["hips"], g["knees"]) - g.get("thigh_radius", THIGH_RADIUS),
+      _segment_distance(point, g["knees"], g["feet"]) - g.get("calf_radius", CALF_RADIUS),
     ],
     dim=-1,
   )
+  if g.get("wheel_radius", 0.0):
+    # Conservative sphere around each wheel, shared by env and imagination.
+    wheel_gap = (point.unsqueeze(-2) - g["feet"]).square().sum(-1).add(1e-8).sqrt() - g.get("wheel_radius", 0.0)
+    parts = torch.cat([parts, wheel_gap], -1)
   return _softmin(parts, -1) - radius
 
 
@@ -121,6 +130,7 @@ def _dodge_close(st, robot_xy, near: float) -> torch.Tensor:
 def dodge_shaping(
   st: dict[str, torch.Tensor], robot_xy: torch.Tensor, base_z: torch.Tensor,
   foot_z: torch.Tensor | None = None, near: float = 1.2,
+  stand_height: float = STAND_HEIGHT,
 ) -> torch.Tensor:
   """Training-wheels hint (N,) while an obstacle is within `near` metres: height
   gained above standing for LOW bars (jump), height lost for HIGH bars and HIGH
@@ -128,8 +138,8 @@ def dodge_shaping(
   foot_z (N, 4)). MID balls get none (sidestep). Annealed to zero during training
   so the final policy is driven by outcomes only."""
   close = _dodge_close(st, robot_xy, near)
-  up = (base_z - STAND_HEIGHT).clamp(0.0, 0.3)
-  down = (STAND_HEIGHT - base_z).clamp(0.0, 0.15)
+  up = (base_z - stand_height).clamp(0.0, 0.3)
+  down = (stand_height - base_z).clamp(0.0, 0.15)
   kind, style = st["kind"], st["style"]
   ball = kind == BALL
   lift = torch.zeros_like(up) if foot_z is None else (foot_z.max(-1).values - 0.03).clamp(0.0, 0.2)
@@ -205,14 +215,16 @@ def obstacle_penetration(
   sum over body points of (margin - gap)+. Zero when clear; smooth for imagination."""
   obst = ob.unpack(obst_flat)
   c, s = g["yaw"].cos(), g["yaw"].sin()
-  local = torch.tensor(_TRUNK_OUTLINE, device=obst.device)
+  xmin, xmax, ymin, ymax, _, _ = g.get("bounds", (*TRUNK_X, *TRUNK_Y, -TRUNK_BELOW_BASE, TRUNK_ABOVE_BASE))
+  outline = tuple((x, y) for x in (xmin, (xmin + xmax) / 2, xmax) for y in (ymin, ymax)) + ((xmin, 0.0), (xmax, 0.0))
+  local = torch.tensor(outline, device=obst.device)
   tx = g["base_xy"][:, None, 0] + c[:, None] * local[:, 0] - s[:, None] * local[:, 1]
   ty = g["base_xy"][:, None, 1] + s[:, None] * local[:, 0] + c[:, None] * local[:, 1]
   pts = torch.cat([torch.stack([tx, ty], -1), g["knees"][..., :2], g["feet"][..., :2]], 1)
   radius = torch.cat([
-    torch.zeros(len(_TRUNK_OUTLINE), device=obst.device),
-    torch.full((4,), THIGH_RADIUS, device=obst.device),
-    torch.full((4,), CALF_RADIUS, device=obst.device),
+    torch.zeros(len(outline), device=obst.device),
+    torch.full((4,), g.get("thigh_radius", THIGH_RADIUS), device=obst.device),
+    torch.full((4,), max(g.get("calf_radius", CALF_RADIUS), g.get("wheel_radius", 0.0)), device=obst.device),
   ])
   gap = ob.sdf(pts, obst) - radius.view(1, -1, 1)
   return (margin - gap).clamp(min=0.0).sum((-1, -2))

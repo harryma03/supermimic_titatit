@@ -37,13 +37,13 @@ def unpack_generator(gen, packed: torch.Tensor) -> torch.Tensor:
 
 class ReplayBuffer:
   def __init__(self, num_envs: int, length: int, obs_dim: int, device: str,
-               gen_dim: int = GEN_DIM):
+               gen_dim: int = GEN_DIM, num_joints: int = 12):
     self.n, self.L, self.device = num_envs, length, device
     f = lambda *shape: torch.zeros(num_envs, length, *shape, device=device)  # noqa: E731
-    self.s = f(st.STATE_DIM)
+    self.s = f(st.StateLayout(num_joints).state_dim)
     self.pose = f(3)
-    self.a = f(st.NUM_JOINTS)
-    self.a_prev = f(st.NUM_JOINTS)
+    self.a = f(num_joints)
+    self.a_prev = f(num_joints)
     # Observations dominate memory; half precision is plenty for seeding rollouts.
     self.obs = torch.zeros(num_envs, length, obs_dim, device=device, dtype=torch.float16)
     self.relief = torch.zeros(num_envs, length, SCAN_POINTS, device=device, dtype=torch.float16)
@@ -90,12 +90,12 @@ class WindowArchive:
   flight, falls). Unlike the replay buffer it is not overwritten every few
   seconds of sim time, so the world model keeps seeing jumps and landings."""
 
-  def __init__(self, capacity: int, k: int, context_dim: int, device: str):
+  def __init__(self, capacity: int, k: int, context_dim: int, device: str, num_joints: int = 12):
     self.cap, self.device = capacity, device
     z = lambda *shape: torch.zeros(capacity, *shape, device=device)  # noqa: E731
     self.data = {
-      "s": z(k + 1, st.STATE_DIM), "pose": z(k + 1, 3), "a": z(k, st.NUM_JOINTS),
-      "a_prev": z(k, st.NUM_JOINTS), "xi": z(context_dim), "valid": z(k),
+      "s": z(k + 1, st.StateLayout(num_joints).state_dim), "pose": z(k + 1, 3), "a": z(k, num_joints),
+      "a_prev": z(k, num_joints), "xi": z(context_dim), "valid": z(k),
       "relief": torch.zeros(capacity, k, SCAN_POINTS, device=device, dtype=torch.float16),
     }
     self.ptr = 0

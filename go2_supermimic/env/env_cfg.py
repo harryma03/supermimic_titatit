@@ -35,7 +35,7 @@ def _quiet_solver_warnings(env, env_ids) -> None:
   """Startup event: silence per-step solver iteration-limit warnings (with
   thousands of worlds one hits the limit nearly every step)."""
   del env_ids
-  from mujoco_warp import OverflowType
+  from mujoco_warp._src.types import OverflowType
 
   opt = env.sim.wp_model.opt
   opt.warn_overflow = int(opt.warn_overflow) & ~int(
@@ -218,7 +218,7 @@ def go2_chase_env_cfg(play: bool = False, terrain: bool = False,
     "crouch": RewardTermCfg(func=mdp.crouch, weight=-30.0, params=p),
     "joint_deviation_l2": RewardTermCfg(func=mdp.joint_deviation_l2, weight=-0.1),
     "base_height_low": RewardTermCfg(func=mdp.base_height_low, weight=-10.0,
-                                     params={"min_height": 0.18}),
+                                     params={}),
     "terminated": RewardTermCfg(func=envs_mdp.is_terminated, weight=-200.0),
     "action_rate_l2": RewardTermCfg(func=envs_mdp.action_rate_l2, weight=-0.05),
     "dof_pos_limits": RewardTermCfg(func=envs_mdp.joint_pos_limits, weight=-1.0),
