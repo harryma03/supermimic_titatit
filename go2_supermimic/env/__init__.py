@@ -30,3 +30,9 @@ for task_id, kw in (
     play_env_cfg=titatit_chase_env_cfg(play=True, **kw),
     rl_cfg=RslRlOnPolicyRunnerCfg(),
   )
+
+from go2_supermimic.env.velocity_env_cfg import titatit_velocity_env_cfg
+register_mjlab_task(
+  task_id="Titatit-Velocity-Flat", env_cfg=titatit_velocity_env_cfg(),
+  play_env_cfg=titatit_velocity_env_cfg(play=True), rl_cfg=RslRlOnPolicyRunnerCfg(),
+)

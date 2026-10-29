@@ -55,9 +55,9 @@ class WorldModel(nn.Module):
   of the local ground grid (terrain and obstacles, see target/terrain.py), so
   stepping onto a stair or pushing into a wall is predictable."""
 
-  def __init__(self, hidden: tuple[int, ...] = (1024, 1024, 1024), num_joints: int = 12):
+  def __init__(self, hidden: tuple[int, ...] = (1024, 1024, 1024), num_joints: int = 12, extra_state_dim: int = 0):
     super().__init__()
-    self.state_dim = st.StateLayout(num_joints).state_dim
+    self.state_dim = st.StateLayout(num_joints).state_dim + extra_state_dim
     in_dim = self.state_dim + 2 * num_joints + st.CONTEXT_DIM + SCAN_POINTS
     out_dim = self.state_dim + st.POSE_DELTA_DIM
     self.net = mlp(in_dim, hidden, out_dim)

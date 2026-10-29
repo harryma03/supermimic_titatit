@@ -22,7 +22,7 @@ from torch import nn
 from torch.utils.tensorboard import SummaryWriter
 
 from go2_supermimic.supermimic import state as st
-from go2_supermimic.supermimic.buffer import ReplayBuffer, WindowArchive, pack_generator
+from go2_supermimic.supermimic.buffer import ReplayBuffer, WindowArchive, pack_generator, GEN_DIM
 from go2_supermimic.supermimic.imagine import ImagineCfg, Imagination, RewardWeights
 from go2_supermimic.supermimic.world_model import RunningNorm, WorldModel, mlp
 from go2_supermimic.target import terrain as tr
@@ -31,6 +31,7 @@ from go2_supermimic.target import terrain as tr
 @dataclass(kw_only=True)
 class TrainCfg:
   task: str = "Go2-Chase-Terrain"
+  device: str = "cuda:0"
   num_envs: int = 4096
   buffer_len: int = 1000
   iterations: int = 40_000
@@ -234,13 +235,17 @@ class Trainer:
     env_cfg = load_env_cfg(cfg.task)
     env_cfg.scene.num_envs = cfg.num_envs
     env_cfg.seed = cfg.seed
-    env_cfg.commands["target"].target.curriculum_steps = cfg.target_curriculum_iterations
+    self.velocity = "velocity" in env_cfg.commands
+    if not self.velocity:
+      env_cfg.commands["target"].target.curriculum_steps = cfg.target_curriculum_iterations
+    if self.velocity and (cfg.driver_policy or cfg.expert_policy):
+      raise ValueError("Velocity uses online simulation data, not Chase data drivers")
     if "terrain_levels" in env_cfg.curriculum:
       env_cfg.curriculum["terrain_levels"].params["steps"] = cfg.terrain_curriculum_iterations
     self.env_cfg = env_cfg
-    self.env = ManagerBasedRlEnv(cfg=env_cfg, device="cuda:0")
+    self.env = ManagerBasedRlEnv(cfg=env_cfg, device=cfg.device)
     self.dev = self.env.device
-    self.term = self.env.command_manager.get_term("target")
+    self.term = self.env.command_manager.get_term("velocity" if self.velocity else "target")
     self.history = env_cfg.observations["actor"].history_length
 
     obs, _ = self.env.reset()
@@ -252,13 +257,17 @@ class Trainer:
     self.xi = self.ctx.read()
     self.enc_bias = self.env.scene["robot"].data.encoder_bias[:, st.action_joint_ids(self.env)].clone() * self.consts.position_mask
 
-    self.wm = WorldModel(cfg.wm_hidden, self.num_actions).to(self.dev)
+    from go2_supermimic.supermimic.velocity import EXTRA_DIM
+    extra_dim = EXTRA_DIM if self.velocity else 0
+    self.wm = WorldModel(cfg.wm_hidden, self.num_actions, extra_dim).to(self.dev)
     self.actor = Actor(obs_dim, cfg.actor_hidden, self.num_actions).to(self.dev)
     self.opt_wm = torch.optim.Adam(self.wm.parameters(), lr=cfg.lr)
     self.opt_actor = torch.optim.Adam(self.actor.parameters(), lr=cfg.lr, betas=(0.9, 0.95))
 
-    self.buf = ReplayBuffer(cfg.num_envs, cfg.buffer_len, obs_dim, self.dev, num_joints=self.num_actions)
-    self.archive = WindowArchive(cfg.archive_size, cfg.wm_window, st.CONTEXT_DIM, self.dev, num_joints=self.num_actions)
+    self.buf = ReplayBuffer(cfg.num_envs, cfg.buffer_len, obs_dim, self.dev, num_joints=self.num_actions,
+                            extra_state_dim=extra_dim, command_dim=3 if self.velocity else 0,
+                            gen_dim=0 if self.velocity else GEN_DIM)
+    self.archive = WindowArchive(cfg.archive_size, cfg.wm_window, st.CONTEXT_DIM, self.dev, num_joints=self.num_actions, extra_state_dim=extra_dim)
     self.explore = torch.arange(cfg.num_envs, device=self.dev) < int(cfg.explore_frac * cfg.num_envs)
     self.ou = torch.zeros(cfg.num_envs, self.num_actions, device=self.dev)
     # Imagination uses the env's reward weights, so the two cannot drift apart.
@@ -266,10 +275,17 @@ class Trainer:
                                for f in fields(RewardWeights) if f.name in env_cfg.rewards})
     imag_cfg = ImagineCfg(horizon=cfg.horizon, compile=cfg.compile, sensor_grad=cfg.sensor_grad,
                           weights=weights)
-    self.field = self.term.height_field  # None on flat ground
+    self.field = None if self.velocity else self.term.height_field
     self.terms = st.obs_terms(env_cfg)
-    self.imag = Imagination(imag_cfg, self.consts, self.term.cfg.target, self.history, self.dev,
-                            self.terms, self.field)
+    imag_cfg.dt = self.env.step_dt
+    if self.velocity:
+      from go2_supermimic.supermimic.velocity_imagine import VelocityImagination
+      self.imag = VelocityImagination(imag_cfg, self.consts, self.term.cfg.rewards,
+                                      self.history, self.terms,
+                                      noise=env_cfg.observations['actor'].enable_corruption)
+    else:
+      self.imag = Imagination(imag_cfg, self.consts, self.term.cfg.target, self.history, self.dev,
+                              self.terms, self.field)
     self.critic = Critic(self.imag.critic_dim, cfg.critic_hidden).to(self.dev)
     self.opt_critic = torch.optim.Adam(self.critic.parameters(), lr=cfg.lr)
     self.driver = self.expert = None
@@ -305,8 +321,39 @@ class Trainer:
     if cfg.resume:
       self.load(cfg.resume)
 
+  @property
+  def wheel_radius(self):
+    if self.velocity:
+      from go2_supermimic.robot.titatit import WHEEL_RADIUS
+      return WHEEL_RADIUS
+    return self.term.cfg.target.wheel_radius
+
+  def velocity_contract(self):
+    return {'version': 1, 'state_dim': self.wm.state_dim, 'terms': self.terms,
+            'history': self.history, 'dt': self.env.step_dt,
+            'command': asdict(self.term.cfg)}
+
+  def _velocity_curriculum(self, it):
+    if it < self.term.cfg.stage_iterations[-1] or getattr(self.env, 'velocity_dr_enabled', False):
+      return
+    self.env.velocity_dr_enabled = True
+    # Startup contains only velocity DR and encoder bias. Reset history after
+    # changing the model, and invalidate the replay boundary across this change.
+    self.env.event_manager.apply(mode='startup')
+    obs, _ = self.env.reset()
+    self.obs = obs['actor']
+    self.a_prev.zero_(); self.ou.zero_()
+    if self.buf.size:
+      self.buf.done[:, (self.buf.ptr-1) % self.buf.L] = 1
+    self.xi = self.ctx.read()
+    self.enc_bias = self.env.scene['robot'].data.encoder_bias[:, st.action_joint_ids(self.env)].clone()*self.consts.position_mask
+
   def load(self, path: str) -> None:
     ckpt = torch.load(path, map_location=self.dev, weights_only=False)
+    if self.velocity and ckpt['cfg']['task'] != self.cfg.task:
+      raise ValueError("Velocity has augmented dynamics and new reward semantics: train from scratch; use same-task checkpoints only")
+    if self.velocity and ckpt.get('velocity_contract') != self.velocity_contract():
+      raise ValueError("Velocity checkpoint observation/reward/dynamics contract differs")
     wm_sd = self.wm.state_dict()
     same_wm = all(
       k in ckpt["world_model"] and ckpt["world_model"][k].shape == v.shape for k, v in wm_sd.items()
@@ -368,7 +415,8 @@ class Trainer:
     for _ in range(cfg.collect_steps):
       s = st.robot_state(env, field=self.field)
       pose = st.planar_pose(env)
-      gen = pack_generator(self.term.gen)
+      gen = s.new_empty((env.num_envs,0)) if self.velocity else pack_generator(self.term.gen)
+      command = self.term.command.clone() if self.velocity else None
       relief = self._relief(pose)
       a = self.actor(self.obs)
       dt = env.step_dt
@@ -396,7 +444,7 @@ class Trainer:
         self.driver.reset(done)
         self.steer.resample(done, self.term.gen.center)
       self.ou = torch.where(done.unsqueeze(-1), torch.zeros_like(self.ou), self.ou)
-      self.buf.add(s, pose, a, self.a_prev, self.obs, gen, done, relief)
+      self.buf.add(s, pose, a, self.a_prev, self.obs, gen, done, relief, command=command, xi=self.xi, enc_bias=self.enc_bias)
       keep = ~done
       if keep.any():
         s1 = st.robot_state(env, field=self.field)
@@ -424,21 +472,21 @@ class Trainer:
   # Phase 2.
 
   def _relief(self, pose: torch.Tensor) -> torch.Tensor:
-    return tr.relief(pose[:, :2], pose[:, 2], self.field, self.term.obstacle_layout)
+    return tr.relief(pose[:, :2], pose[:, 2], self.field, None if self.velocity else self.term.obstacle_layout)
 
   def _gather(self, env, idx, valid) -> dict[str, torch.Tensor]:
     b, k = self.buf, self.cfg.wm_window
     e = env.unsqueeze(-1)
     return {
       "s": b.s[e, idx], "pose": b.pose[e, idx], "a": b.a[e, idx[:, :k]],
-      "a_prev": b.a_prev[e, idx[:, :k]], "xi": self.xi[env], "valid": valid,
+      "a_prev": b.a_prev[e, idx[:, :k]], "xi": b.xi[env, idx[:, 0]], "valid": valid,
       "relief": b.relief[e, idx[:, :k]],
     }
 
   def _rarity(self, w: dict[str, torch.Tensor]) -> torch.Tensor:
     """Contact changes + flight steps + an early episode end (a fall) per window."""
-    s = w["s"]
-    contact = st.feet_world_z(s.reshape(-1, s.shape[-1]), self.term.cfg.target.wheel_radius) < 0.035
+    s = w["s"][:, :, :st.StateLayout(self.num_actions).state_dim]
+    contact = st.feet_world_z(s.reshape(-1, s.shape[-1]), self.wheel_radius) < 0.035
     contact = contact.reshape(s.shape[0], -1, 4).float()
     changes = (contact[:, 1:] - contact[:, :-1]).abs().sum((1, 2))
     airborne = (contact.sum(-1) == 0).float().sum(-1)
@@ -448,8 +496,8 @@ class Trainer:
   def _archive_worthy(self, w: dict[str, torch.Tensor]) -> torch.Tensor:
     """Genuinely rare windows: a flight phase (all feet off for >= 2 steps), a
     hard vertical base motion (take-off / landing impact) or a fall."""
-    s = w["s"]
-    feet_z = st.feet_world_z(s.reshape(-1, s.shape[-1]), self.term.cfg.target.wheel_radius).reshape(s.shape[0], -1, 4)
+    s = w["s"][:, :, :st.StateLayout(self.num_actions).state_dim]
+    feet_z = st.feet_world_z(s.reshape(-1, s.shape[-1]), self.wheel_radius).reshape(s.shape[0], -1, 4)
     flight = ((feet_z >= 0.035).all(-1).float().sum(-1)) >= 2
     hard_vz = s[:, :, st.V_YAW][..., 2].abs().amax(-1) > 0.6
     fell = w["valid"][:, -1] < 0.5
@@ -502,9 +550,11 @@ class Trainer:
     env, t = b.sample_states(cfg.imag_batch)
     seed = {
       "env": env, "s": b.s[env, t], "pose": b.pose[env, t], "a_prev": b.a_prev[env, t],
-      "obs": b.obs[env, t].float(), "gen": b.gen[env, t], "xi": self.xi[env],
-      "enc_bias": self.enc_bias[env],
+      "obs": b.obs[env, t].float(), "gen": b.gen[env, t], "xi": b.xi[env, t],
+      "command": b.command[env, t],
+      "enc_bias": b.enc_bias[env, t],
     }
+    self.opt_wm.zero_grad(set_to_none=True)
     for p in self.wm.parameters():
       p.requires_grad_(False)
     hint = cfg.dodge_shaping * max(0.0, 1.0 - self.it / max(1, cfg.dodge_shaping_decay_iterations))
@@ -563,6 +613,7 @@ class Trainer:
         "opt_critic": self.opt_critic.state_dict(),
         "obs_dim": self.obs.shape[-1],
         "act_dim": self.num_actions,
+        "velocity_contract": self.velocity_contract() if self.velocity else None,
       },
       path,
     )
@@ -571,10 +622,16 @@ class Trainer:
   def run(self) -> None:
     cfg = self.cfg
     t_start = time.time()
+    if self.velocity:
+      self.term.iteration = self.start_it
+      self._velocity_curriculum(self.start_it)
     while self.buf.size <= cfg.wm_window + 1:
       self.collect()
     for it in range(self.start_it + 1, cfg.iterations + 1):
       self.it = it
+      if self.velocity:
+        self.term.iteration = it
+        self._velocity_curriculum(it)
       lr = lr_at(cfg, it) * self.lr_scale
       start = max(self.ramp_start, self.actor_frozen_until, self.policy_start)
       ramp = min(1.0, max(0.0, it - start) / max(1, cfg.actor_ramp_iterations))
@@ -597,10 +654,11 @@ class Trainer:
         line.append(f"archive {self.archive.size}")
         if self.nonfinite_steps:
           line.append(f"nonfinite_skipped {self.nonfinite_steps}")
-        rates = self.term.kind_hit_rate.tolist()
-        for name, r in zip(("ball", "low_bar", "high_bar"), rates):
-          self.writer.add_scalar(f"Metrics/hit_rate/{name}", r, it)
-        line.append("hit_rate " + "/".join(f"{r:.2f}" for r in rates))
+        if not self.velocity:
+          rates = self.term.kind_hit_rate.tolist()
+          for name, r in zip(("ball", "low_bar", "high_bar"), rates):
+            self.writer.add_scalar(f"Metrics/hit_rate/{name}", r, it)
+          line.append("hit_rate " + "/".join(f"{r:.2f}" for r in rates))
         falls = self.ep_stats.get("Episode_Termination/fell_over", [])
         falls_mean = sum(falls) / len(falls) if falls else 0.0
         for k, vals in self.ep_stats.items():

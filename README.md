@@ -159,6 +159,12 @@ docs/titatit.md            TITATIT 详细说明
 weights/                  原 Go2 策略，仅供 Go2 任务使用
 ```
 
+## 更新代码
+git status
+git add .
+git commit -m "Update office litewheel config"
+git push origin main
+
 ## 来源与许可证
 
 本项目基于 [Go2-SuperMimic](https://github.com/Zhengtianjin/go2-supermimic)，保留原代码署名和 [MIT 许可证](LICENSE)。训练方法来自 [SuperMimic 论文](https://arxiv.org/abs/2610.28480)，仿真基于 [mjlab](https://github.com/mujocolab/mjlab) 和 MuJoCo Warp。

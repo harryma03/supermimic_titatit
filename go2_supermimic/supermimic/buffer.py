@@ -37,10 +37,13 @@ def unpack_generator(gen, packed: torch.Tensor) -> torch.Tensor:
 
 class ReplayBuffer:
   def __init__(self, num_envs: int, length: int, obs_dim: int, device: str,
-               gen_dim: int = GEN_DIM, num_joints: int = 12):
+               gen_dim: int = GEN_DIM, num_joints: int = 12, extra_state_dim: int = 0, command_dim: int = 0):
     self.n, self.L, self.device = num_envs, length, device
     f = lambda *shape: torch.zeros(num_envs, length, *shape, device=device)  # noqa: E731
-    self.s = f(st.StateLayout(num_joints).state_dim)
+    self.s = f(st.StateLayout(num_joints).state_dim + extra_state_dim)
+    self.command = f(command_dim)
+    self.enc_bias = f(num_joints)
+    self.xi = f(st.CONTEXT_DIM)
     self.pose = f(3)
     self.a = f(num_joints)
     self.a_prev = f(num_joints)
@@ -52,8 +55,11 @@ class ReplayBuffer:
     self.ptr = 0
     self.size = 0
 
-  def add(self, s, pose, a, a_prev, obs, gen, done, relief) -> None:
+  def add(self, s, pose, a, a_prev, obs, gen, done, relief, command=None, xi=None, enc_bias=None) -> None:
     i = self.ptr
+    if command is not None: self.command[:, i] = command
+    if xi is not None: self.xi[:, i] = xi
+    if enc_bias is not None: self.enc_bias[:, i] = enc_bias
     self.s[:, i], self.pose[:, i], self.a[:, i], self.a_prev[:, i] = s, pose, a, a_prev
     self.relief[:, i] = relief.half()
     self.obs[:, i], self.gen[:, i], self.done[:, i] = obs.half(), gen, done.float()
@@ -90,11 +96,11 @@ class WindowArchive:
   flight, falls). Unlike the replay buffer it is not overwritten every few
   seconds of sim time, so the world model keeps seeing jumps and landings."""
 
-  def __init__(self, capacity: int, k: int, context_dim: int, device: str, num_joints: int = 12):
+  def __init__(self, capacity: int, k: int, context_dim: int, device: str, num_joints: int = 12, extra_state_dim: int = 0):
     self.cap, self.device = capacity, device
     z = lambda *shape: torch.zeros(capacity, *shape, device=device)  # noqa: E731
     self.data = {
-      "s": z(k + 1, st.StateLayout(num_joints).state_dim), "pose": z(k + 1, 3), "a": z(k, num_joints),
+      "s": z(k + 1, st.StateLayout(num_joints).state_dim + extra_state_dim), "pose": z(k + 1, 3), "a": z(k, num_joints),
       "a_prev": z(k, num_joints), "xi": z(context_dim), "valid": z(k),
       "relief": torch.zeros(capacity, k, SCAN_POINTS, device=device, dtype=torch.float16),
     }

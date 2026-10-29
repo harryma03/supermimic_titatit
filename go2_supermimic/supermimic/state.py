@@ -134,11 +134,14 @@ OBS_NOISE = {
 def obs_terms(env_cfg) -> tuple[tuple[str, int], ...]:
   """Actor terms (name, per-frame dim) of an env config, in order."""
   names = list(env_cfg.observations["actor"].terms)
-  rays = env_cfg.commands["target"].target.obstacles.lidar_rays
+  rays = env_cfg.commands["target"].target.obstacles.lidar_rays if "target" in env_cfg.commands else 0
   n = 16 if "wheel_vel" in env_cfg.actions else 12
-  known = dict(OBS_TERMS) | {"joint_pos": n, "joint_vel": n, "actions": n} | {"lidar": rays, "height_scan": SCAN_POINTS}
+  known = dict(OBS_TERMS) | {"joint_pos": n, "joint_vel": n, "actions": n} | {"lidar": rays, "height_scan": SCAN_POINTS, "velocity": 3}
   terms = tuple((n, known[n]) for n in names)
-  assert [n for n, _ in terms[: len(OBS_TERMS)]] == [n for n, _ in OBS_TERMS], names
+  expected = [n for n, _ in OBS_TERMS]
+  if "velocity" in env_cfg.commands:
+    expected[-1] = "velocity"
+  assert [n for n, _ in terms[: len(OBS_TERMS)]] == expected, names
   return terms
 
 
@@ -220,7 +223,7 @@ def robot_state(env, field=None) -> torch.Tensor:
     r = limbs[name] - d.root_link_pos_w.unsqueeze(1)
     rel.append(torch.stack([yaw_rotate_inverse(r[:, i], heading) for i in range(4)], 1))
   base_h = d.root_link_pos_w[:, 2:3] - ground(d.root_link_pos_w[:, :2], field).unsqueeze(-1)
-  return torch.cat(
+  core = torch.cat(
     [
       base_h,
       d.projected_gravity_b,
@@ -231,6 +234,11 @@ def robot_state(env, field=None) -> torch.Tensor:
     ] + [r.reshape(-1, 12) for r in rel],
     dim=-1,
   )
+
+  if "velocity" in env.cfg.commands:
+    from go2_supermimic.supermimic.velocity import auxiliary_state
+    return torch.cat([core, auxiliary_state(env)], -1)
+  return core
 
 
 def planar_pose(env) -> torch.Tensor:

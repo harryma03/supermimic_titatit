@@ -1,10 +1,11 @@
 # TITATIT 三种追逐/躲避任务
 
-| 任务 | 场景 | actor 输入 | 动作 |
-| --- | --- | ---: | ---: |
-| `Titatit-Chase-Flat` | 平地 | 410 | 16 |
-| `Titatit-Chase-Obstacles` | 静态障碍与 16 射线 LiDAR | 490 | 16 |
-| `Titatit-Chase-Terrain` | 台阶、方块、粗糙地面、斜坡，77 点高度扫描 | 795 | 16 |
+
+| 任务                      | 场景                                      | actor 输入 | 动作 |
+| --------------------------- | ------------------------------------------- | -----------: | -----: |
+| `Titatit-Chase-Flat`      | 平地                                      |        410 |   16 |
+| `Titatit-Chase-Obstacles` | 静态障碍与 16 射线 LiDAR                  |        490 |   16 |
+| `Titatit-Chase-Terrain`   | 台阶、方块、粗糙地面、斜坡，77 点高度扫描 |        795 |   16 |
 
 复用 Go2 三种任务的目标生成、奖励权重、地形、课程、随机化和 50 Hz 策略周期。
 物理步长仍是本项目的 0.005 秒，decimation=4；没有移植 DreamWaQ 的算法、奖励或随机化。
@@ -69,38 +70,3 @@ python -m pytest tests
 
 测试覆盖三任务配置、模型/力矩限位/默认姿态、Go2 和 TITATIT 的世界模型/缓存/想象反向传播及轮部碰撞。
 CPU 短仿真与短训练用于验证数据链路；不代表策略已收敛或验证了实际运动能力。
-
-本次检查：32 项测试通过；平地、障碍、完整 5×7 地形均完成 CPU reset、5 步动作、真实/想象观测对齐与策略反向传播。平地另完成 2 次训练迭代，世界模型、actor、critic 更新与 checkpoint 保存通过；AOT eager 完整图反向传播通过。当前执行会话未检测到 CUDA 设备，GPU/Inductor 运行和长程收敛未验证。
-
-## 指定物理 GPU1
-
-```bash
-CUDA_VISIBLE_DEVICES=1 python scripts/train.py --task Titatit-Chase-Flat --run-name titatit_flat_gpu1
-```
-
-`CUDA_VISIBLE_DEVICES=1` 将物理 GPU1 映射为进程内的 `cuda:0`，与现有脚本匹配。另两任务对应换成 `Titatit-Chase-Obstacles`、`Titatit-Chase-Terrain`。
-
-## 任务 2 的虚拟雷达原点
-
-当前是由静态障碍几何直接计算的二维 LiDAR：原点为机器人 base 的 XY，方向随 base yaw 旋转，16 条射线均匀覆盖 360°，最大距离 4 m。不使用实体雷达 link、安装高度或俯仰角，也不扫描机器人本体和抛掷物。仿真任务可直接训练；若要匹配实物雷达，需明确相对 base 的安装位置、朝向和扫描扇区，并同步修改仿真与想象中的扫描实现。轮足模型替换本身不会自动提供雷达外参。
-
-## 轮足高度奖励适配
-
-TITATIT 三个任务统一使用 `stand_height=0.37 m` 作为跳跃/下蹲引导基准（默认姿态运动学估计，仍需以稳定站姿校准）；Go2 保持 0.27 m。
-`BallTargetCfg.crouch_min_height=0.23 m`、`base_min_height=0.18 m` 已参数化，当前数值保持不变。
-环境与想象奖励读取同一配置，原奖励权重、PD 和动作尺度保持不变。
-
-TensorBoard 新增六项 `Episode_Metrics/penalty/{action_rate_l2,joint_acc_l2,joint_torques_l2}/{legs,wheels}`。
-这些数值是每个策略步的 `原始平方和 × 原奖励权重 × step_dt`，在回合内求均值，再对结束的环境求均值；腿轮之和对应原项的每步加权贡献。
-它们仅用于诊断，不增加任何奖励。与 `Episode_Reward` 的归一化方式不同，不能直接比较其绝对值。
-终端不会逐项显示它们，应在 TensorBoard 查看。
-
-已验证：38 项测试通过；CPU 两次训练迭代、checkpoint 保存及六个 TensorBoard 标量写入通过。
-尚未验证修改后的 GPU 长程训练或低横杆躲避效果。
-修改不会热加载到已经启动的进程。
-
-从之前的 TITATIT 模型建立独立实验（保留 actor/世界模型，重置 critic；不加 `--continue-run`，迭代和课程从头计数）：
-
-```bash
-CUDA_VISIBLE_DEVICES=1 python scripts/train.py --task Titatit-Chase-Flat --resume logs/supermimic/2026-10-28_14-47-23_titatit_flat_gpu1/model_5000.pt --reset-critic true --run-name titatit_flat_height037_gpu1
-```
