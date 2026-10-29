@@ -15,6 +15,19 @@ class VelocityCommandCfg(CommandTermCfg):
   rewards: VelocityRewards = field(default_factory=VelocityRewards)
   fixed_command: tuple[float,float,float] | None = None
 
+  def __post_init__(self):
+    if len(self.ranges)!=3 or any(lo>hi for lo,hi in self.ranges):
+      raise ValueError('Expected three ordered velocity ranges')
+    if len(self.mode_probs)!=5 or min(self.mode_probs)<0 or sum(self.mode_probs)<=0:
+      raise ValueError('Expected five nonnegative mode probabilities')
+    if sum(self.mode_probs[:2])<=0:
+      raise ValueError('Early stages require standing or longitudinal motion')
+    if len(self.stage_iterations)!=5 or self.stage_iterations[0]!=0 or any(
+        a>=b for a,b in zip(self.stage_iterations,self.stage_iterations[1:])):
+      raise ValueError('Expected five increasing stage iterations, starting at zero')
+    if not 0 < self.resampling_time_range[0] <= self.resampling_time_range[1]:
+      raise ValueError('Invalid command resampling interval')
+
   def build(self, env):
     return VelocityCommand(self, env)
 
@@ -49,5 +62,8 @@ class VelocityCommand(CommandTerm):
     else:
       self._command[env_ids] = sample_commands(self.cfg,len(env_ids),self.iteration,self.device)
 
-  def _update_command(self,env_ids): pass
+  def _update_command(self,env_ids):
+    if self.cfg.fixed_command is not None:
+      ids = slice(None) if env_ids is None else env_ids
+      self._command[ids] = torch.tensor(self.cfg.fixed_command,device=self.device)
   def _update_metrics(self): pass

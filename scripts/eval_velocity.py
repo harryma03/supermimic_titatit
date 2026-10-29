@@ -18,16 +18,34 @@ SUITE = [(0.,0.,0.),(.5,0.,0.),(-.5,0.,0.),(0.,.25,0.),(0.,-.25,0.),
          (0.,0.,.8),(0.,0.,-.8),(.5,0.,.5),(0.,.2,.5),(0.,0.,0.)]
 
 
+def summarize_trace(rows):
+  """Keep signed per-axis response separate from pooled tracking rewards."""
+  velocity=torch.stack([r['velocity'] for r in rows])
+  command=torch.stack([r['command'] for r in rows])
+  return {
+    'velocity_mean':velocity.mean((0,1)).tolist(),
+    'velocity_rmse':(velocity-command).square().mean((0,1)).sqrt().tolist(),
+    'height_mean_m':float(torch.stack([r['height'] for r in rows]).mean()),
+    'reward_terms_per_second':{k:float(torch.stack([r['reward_terms'][k] for r in rows]).mean())
+                               for k in rows[0]['reward_terms']},
+    'reset_count':int(torch.stack([r['done'] for r in rows]).sum()),
+  }
+
+
 def evaluate(args):
   ckpt=torch.load(args.checkpoint,map_location=args.device,weights_only=False)
   if ckpt['cfg']['task'] != 'Titatit-Velocity-Flat':
     raise ValueError('Use a Titatit-Velocity-Flat checkpoint')
   cfg=load_env_cfg('Titatit-Velocity-Flat',play=True)
   contract=ckpt.get('velocity_contract')
-  if contract is None: raise ValueError('Missing velocity contract')
+  if contract is None or contract.get('version')!=2:
+    raise ValueError('Expected velocity contract version 2 (active trunk contacts)')
   # Evaluate the checkpoint's reward scales, rather than silently using new ones.
   from go2_supermimic.supermimic.velocity import VelocityRewards
   cfg.commands['velocity'].rewards=VelocityRewards(**contract['command']['rewards'])
+  for name, reward in cfg.rewards.items():
+    reward.weight=cfg.commands['velocity'].rewards.weights[name]
+  cfg.seed=args.seed
   cfg.scene.num_envs=args.num_envs
   cfg.auto_reset=False
   cfg.viewer.width,cfg.viewer.height=args.width,args.height
@@ -56,15 +74,14 @@ def evaluate(args):
   imagined=[];real_windows=[];real_total=torch.zeros(env.num_envs,device=env.device)
   pred=None;alive=None;window_return=None;window_step=0
   phase_stats=[]
+  trace=[]
   def add(name,value): metrics.setdefault(name,[]).append(value.detach().cpu().reshape(-1))
   with torch.inference_mode():
     for phase,cmd in enumerate(schedule):
-      term.cfg.fixed_command=cmd
-      term.command[:]=torch.tensor(cmd,device=env.device)
-      # Only the newest command changes. Older history frames remain historical.
-      hist[:,-3:]=term.command
       before=len(metrics.get('lin_sq',[]))
-      for _ in range(max(1,round(args.seconds/env.step_dt))):
+      phase_trace=[]
+      phase_steps=max(1,round(args.seconds/env.step_dt))
+      for step in range(phase_steps):
         s=st.robot_state(env);pose=st.planar_pose(env)
         if pred is None or window_step == 32:
           seed=dict(s=s,pose=pose,a_prev=previous,obs=hist,command=term.command.clone(),
@@ -76,11 +93,15 @@ def evaluate(args):
         action=actor(hist)
         pred,delta=wm(pred,action,previous,xi,s.new_zeros(env.num_envs,SCAN_POINTS))
         pred_pose=st.apply_pose_delta(pred_pose,delta)
+        executed_command=term.command.clone()
+        # Commands update after reward, before observation/history construction.
+        if step==phase_steps-1 and phase+1<len(schedule):
+          term.cfg.fixed_command=schedule[phase+1]
         obs,reward,done,timeout,_=env.step(action)
         # auto_reset=False: read terminal state, never substitute reset posture.
         sn=st.robot_state(env)
-        add('lin_sq',(sn[:,4:6]-term.command[:,:2]).square().sum(-1))
-        add('yaw_sq',(vertical_yaw_rate(sn)-term.command[:,2]).square())
+        add('lin_sq',(sn[:,4:6]-executed_command[:,:2]).square().sum(-1))
+        add('yaw_sq',(vertical_yaw_rate(sn)-executed_command[:,2]).square())
         add('height',sn[:,0])
         gravity=torch.nn.functional.normalize(sn[:,1:4],dim=-1)
         add('roll',torch.atan2(-gravity[:,1],-gravity[:,2]))
@@ -89,6 +110,21 @@ def evaluate(args):
         add('contacts',sn[:,CONTACT].sum(-1))
         add('action_rate',(action-previous).square().sum(-1))
         add('falls',done.float())
+        row={'time':(phase*phase_steps+step+1)*env.step_dt,
+             'phase':phase,'command':executed_command.cpu(),
+             'velocity':torch.cat([sn[:,4:6],vertical_yaw_rate(sn)[:,None]],-1).cpu(),
+             'height':sn[:,0].cpu(),'action':action.cpu(),
+             'joint_velocity':sn[:,26:42].cpu(),'torque':sn[:,91:107].cpu(),
+             'contact':sn[:,CONTACT].cpu(),'slip':sn[:,SLIP].reshape(-1,4,2).cpu(),
+             'reward_terms':{k:v.cpu()*term.cfg.rewards.weights[k]
+                             for k,v in env._velocity_reward_values.items()},
+             'done':(done|timeout).cpu()}
+        phase_trace.append(row)
+        if args.trace:
+          row.update(state_before=s.cpu(),state_after=sn.cpu(),observation=hist.cpu(),
+                     previous_action=previous.cpu(),context=xi.cpu(),encoder_bias=bias.cpu(),
+                     pose=pose.cpu())
+          trace.append(row)
         real_total+=reward
         window_return+=imag.cfg.gamma**window_step*alive*reward
         alive &= ~(done|timeout)
@@ -113,9 +149,10 @@ def evaluate(args):
       pred=None
       phase_stats.append({'command':cmd,
         'linear_tracking_rmse_m_s':float(torch.cat(metrics['lin_sq'][before:]).mean().sqrt()),
-        'yaw_tracking_rmse_rad_s':float(torch.cat(metrics['yaw_sq'][before:]).mean().sqrt())})
+        'yaw_tracking_rmse_rad_s':float(torch.cat(metrics['yaw_sq'][before:]).mean().sqrt()),
+        'last_half':summarize_trace(phase_trace[len(phase_trace)//2:])})
   m={k:torch.cat(v) for k,v in metrics.items()}
-  duration=args.seconds*len(schedule)
+  duration=max(1,round(args.seconds/env.step_dt))*env.step_dt*len(schedule)
   report={
     'linear_tracking_rmse_m_s':float(m['lin_sq'].mean().sqrt()),
     'yaw_tracking_rmse_rad_s':float(m['yaw_sq'].mean().sqrt()),
@@ -135,6 +172,7 @@ def evaluate(args):
   }
   print(json.dumps(report,indent=2))
   if args.output: Path(args.output).write_text(json.dumps(report,indent=2))
+  if args.trace: torch.save({'checkpoint':args.checkpoint,'dt':env.step_dt,'samples':trace},args.trace)
   if args.video:
     import mediapy
     mediapy.write_video(args.video,frames,fps=round(1/env.step_dt))
@@ -147,6 +185,7 @@ def main():
   for name in ('vx','vy','yaw'):p.add_argument('--'+name,type=float,default=0.)
   p.add_argument('--num-envs',type=int,default=64);p.add_argument('--seconds',type=float,default=10.,help='Seconds per suite phase')
   p.add_argument('--device',default='cuda:0');p.add_argument('--suite',action='store_true')
+  p.add_argument('--seed',type=int,default=0);p.add_argument('--trace',help='Save aligned per-step tensors to a .pt file')
   p.add_argument('--viewer',action='store_true');p.add_argument('--video');p.add_argument('--output')
   p.add_argument('--width',type=int,default=1280);p.add_argument('--height',type=int,default=720)
   args=p.parse_args()

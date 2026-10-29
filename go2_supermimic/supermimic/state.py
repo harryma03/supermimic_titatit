@@ -292,11 +292,12 @@ class ContextReader:
 def obs_frame(
   s: torch.Tensor,
   last_action: torch.Tensor,
-  target_obs: torch.Tensor,
+  command_obs: torch.Tensor,
   encoder_bias: torch.Tensor,
   noise: bool,
   lidar: torch.Tensor | None = None,
   height_scan: torch.Tensor | None = None,
+  command_name: str = "target",
 ) -> dict[str, torch.Tensor]:
   """One frame of each actor observation term, computed from the model state."""
   layout = StateLayout(last_action.shape[-1])
@@ -306,7 +307,7 @@ def obs_frame(
     "joint_pos": s[:, layout.q] + encoder_bias,
     "joint_vel": s[:, layout.qd],
     "actions": last_action,
-    "target": target_obs,
+    command_name: command_obs,
   }
   if lidar is not None:
     frame["lidar"] = lidar

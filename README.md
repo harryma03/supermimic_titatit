@@ -162,7 +162,7 @@ weights/                  原 Go2 策略，仅供 Go2 任务使用
 ## 更新代码
 git status
 git add .
-git commit -m "Update office litewheel config"
+git commit -m "Update titatit_vel"
 git push origin main
 
 ## 来源与许可证

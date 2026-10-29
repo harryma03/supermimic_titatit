@@ -74,11 +74,10 @@ def reward_terms(s0, s, a, previous, commands, default_q, limits, cfg):
 
 
 def observation_frame(s, previous, commands, bias, noise=False):
-  frame = st.obs_frame(s[:, :CORE_DIM], previous, commands, bias, noise=False)
+  frame = st.obs_frame(s[:, :CORE_DIM], previous, commands, bias, noise=False, command_name="velocity")
   if noise:
     for name in ('base_ang_vel','projected_gravity','joint_vel'):
       frame[name] = frame[name] + (2*torch.rand_like(frame[name])-1)*st.OBS_NOISE[name]
-  frame['velocity'] = frame.pop('target')
   # Continuous wheel angles AND encoder/noise on those unused slots are masked.
   frame['joint_pos'] = torch.cat([frame['joint_pos'][:, :12], torch.zeros_like(previous[:, 12:])], -1)
   return frame

@@ -141,3 +141,61 @@ def test_stage_five_randomization_preserves_replay_boundary(trainer):
   assert (t.buf.done[:,(t.buf.ptr-1)%t.buf.L]==1).all()
   torch.testing.assert_close(t.buf.enc_bias,old_bias)
   assert torch.isfinite(t.obs).all()
+
+
+def test_existing_trunk_boxes_really_produce_contact(trainer):
+  env=trainer.env;robot=env.scene['robot']
+  pose=robot.data.root_link_pose_w.clone();pose[:,2]=.04
+  robot.write_root_link_pose_to_sim(pose)
+  env.sim.forward();env.sim.sense()
+  assert (env.scene['velocity_body_contact'].data.found>0).any()
+  assert (st.robot_state(env)[:,90]>0).all()
+  env.reset()
+
+
+def test_fixed_command_changes_enter_history_on_next_observation(trainer):
+  t=trainer;env=t.env
+  t.term.cfg.fixed_command=(.5,0.,0.)
+  obs,_=env.reset();before=obs['actor'].clone()
+  t.term.cfg.fixed_command=(0.,0.,.8)
+  obs,_,_,_,_=env.step(torch.zeros(env.num_envs,16,device=env.device))
+  # Command terms are term-major, oldest -> newest; no duplicated state frame.
+  torch.testing.assert_close(obs['actor'][:,-15:-3],before[:,-12:])
+  torch.testing.assert_close(obs['actor'][:,-3:],torch.tensor([[0.,0.,.8]]).expand(env.num_envs,-1))
+  t.term.cfg.fixed_command=None
+
+
+def test_reward_finetune_requires_new_critic_and_preserves_dynamics():
+  from go2_supermimic.supermimic.train import validate_velocity_resume
+  old={'state_dim':123,'command':{'ranges':[[-1,1]],'rewards':{'sigma_lin':.5}}}
+  new=copy.deepcopy(old);new['command']['rewards']['sigma_lin']=.25
+  with pytest.raises(ValueError,match='reset-critic'):
+    validate_velocity_resume(old,new,False)
+  validate_velocity_resume(old,new,True)
+  new['state_dim']=78
+  with pytest.raises(ValueError,match='contract differs'):
+    validate_velocity_resume(old,new,True)
+  assert old['command']['rewards']['sigma_lin']==.5
+
+
+def test_resumed_critic_warmup_is_relative_to_checkpoint(trainer):
+  t=trainer;path=t.save(5000)
+  old_continue,old_reset=t.cfg.continue_run,t.cfg.reset_critic
+  try:
+    t.cfg.continue_run=True;t.cfg.reset_critic=True
+    t.load(str(path))
+    assert t.start_it==5000
+    assert t.actor_frozen_until>=5000+t.cfg.critic_warmup_iterations
+  finally:
+    t.cfg.continue_run=old_continue;t.cfg.reset_critic=old_reset
+
+
+def test_trace_summary_reports_signed_response():
+  from scripts.eval_velocity import summarize_trace
+  row={'velocity':torch.tensor([[0.,.05,0.]]),'command':torch.tensor([[0.,.2,0.]]),
+       'height':torch.tensor([.36]),'reward_terms':{'track_linear':torch.tensor([1.2])},
+       'done':torch.tensor([False])}
+  result=summarize_trace([row,row])
+  assert result['velocity_mean'][1]==pytest.approx(.05)
+  assert result['velocity_rmse'][1]==pytest.approx(.15)
+  assert result['reset_count']==0

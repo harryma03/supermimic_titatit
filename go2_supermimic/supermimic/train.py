@@ -32,6 +32,8 @@ from go2_supermimic.target import terrain as tr
 class TrainCfg:
   task: str = "Go2-Chase-Terrain"
   device: str = "cuda:0"
+  velocity_sigma_lin: float = 0.0
+  """0 keeps task default; positive values explicitly override tracking width."""
   num_envs: int = 4096
   buffer_len: int = 1000
   iterations: int = 40_000
@@ -224,6 +226,21 @@ def expand_world_model_scan(old: dict, wm: WorldModel) -> bool:
   return True
 
 
+def validate_velocity_resume(old, new, reset_critic):
+  if old == new:
+    return
+  import copy
+  if old is None:
+    raise ValueError("Missing velocity checkpoint contract")
+  left, right = copy.deepcopy(old), copy.deepcopy(new)
+  left['command'].pop('rewards', None)
+  right['command'].pop('rewards', None)
+  if left != right:
+    raise ValueError("Velocity observation/dynamics/command contract differs")
+  if not reset_critic:
+    raise ValueError("Changed velocity rewards require --reset-critic true")
+
+
 class Trainer:
   def __init__(self, cfg: TrainCfg):
     import go2_supermimic.env  # noqa: F401
@@ -236,6 +253,12 @@ class Trainer:
     env_cfg.scene.num_envs = cfg.num_envs
     env_cfg.seed = cfg.seed
     self.velocity = "velocity" in env_cfg.commands
+    if cfg.velocity_sigma_lin < 0:
+      raise ValueError("velocity_sigma_lin must be nonnegative")
+    if cfg.velocity_sigma_lin:
+      if not self.velocity:
+        raise ValueError("velocity_sigma_lin applies only to Velocity")
+      env_cfg.commands["velocity"].rewards.sigma_lin = cfg.velocity_sigma_lin
     if not self.velocity:
       env_cfg.commands["target"].target.curriculum_steps = cfg.target_curriculum_iterations
     if self.velocity and (cfg.driver_policy or cfg.expert_policy):
@@ -280,6 +303,7 @@ class Trainer:
     imag_cfg.dt = self.env.step_dt
     if self.velocity:
       from go2_supermimic.supermimic.velocity_imagine import VelocityImagination
+      self.term.cfg.rewards.weights = {name: term.weight for name, term in env_cfg.rewards.items()}
       self.imag = VelocityImagination(imag_cfg, self.consts, self.term.cfg.rewards,
                                       self.history, self.terms,
                                       noise=env_cfg.observations['actor'].enable_corruption)
@@ -308,6 +332,11 @@ class Trainer:
     self.log_dir = Path(cfg.log_root) / f"{stamp}_{cfg.run_name}"
     self.log_dir.mkdir(parents=True, exist_ok=True)
     self.writer = SummaryWriter(str(self.log_dir))
+    if self.velocity:
+      import json, shlex, sys
+      (self.log_dir / 'config.json').write_text(json.dumps(
+        {'train': asdict(cfg), 'velocity_contract': self.velocity_contract()}, indent=2))
+      (self.log_dir / 'cmd.txt').write_text(shlex.join([sys.executable, *sys.argv])+'\n')
     self.ep_stats: dict[str, list[float]] = defaultdict(list)
     self.env_steps = 0
     self.actor_frozen_until = 0
@@ -329,7 +358,7 @@ class Trainer:
     return self.term.cfg.target.wheel_radius
 
   def velocity_contract(self):
-    return {'version': 1, 'state_dim': self.wm.state_dim, 'terms': self.terms,
+    return {'version': 2, 'trunk_contacts': True, 'state_dim': self.wm.state_dim, 'terms': self.terms,
             'history': self.history, 'dt': self.env.step_dt,
             'command': asdict(self.term.cfg)}
 
@@ -352,8 +381,8 @@ class Trainer:
     ckpt = torch.load(path, map_location=self.dev, weights_only=False)
     if self.velocity and ckpt['cfg']['task'] != self.cfg.task:
       raise ValueError("Velocity has augmented dynamics and new reward semantics: train from scratch; use same-task checkpoints only")
-    if self.velocity and ckpt.get('velocity_contract') != self.velocity_contract():
-      raise ValueError("Velocity checkpoint observation/reward/dynamics contract differs")
+    if self.velocity:
+      validate_velocity_resume(ckpt.get("velocity_contract"), self.velocity_contract(), self.cfg.reset_critic)
     wm_sd = self.wm.state_dict()
     same_wm = all(
       k in ckpt["world_model"] and ckpt["world_model"][k].shape == v.shape for k, v in wm_sd.items()
@@ -404,6 +433,9 @@ class Trainer:
     if self.cfg.continue_run:
       # One env step per iteration: the env-side curricula count env steps.
       self.start_it = int(ckpt.get("iteration", 0))
+      if self.cfg.reset_critic:
+        self.actor_frozen_until = max(self.actor_frozen_until,
+          self.start_it + self.cfg.critic_warmup_iterations)
       self.env.common_step_counter = self.start_it
       print(f"continuing at iteration {self.start_it}", flush=True)
 
@@ -438,7 +470,9 @@ class Trainer:
         self.explore.unsqueeze(-1), self.ou, cfg.action_noise * torch.randn_like(a)
       )
       a = a + noise
-      obs, _, term, trunc, extras = env.step(a)
+      obs, reward, term, trunc, extras = env.step(a)
+      if self.velocity:
+        self.ep_stats["Metrics/velocity/simulator_reward"].append(float(reward.mean()))
       done = term | trunc
       if self.driver is not None:
         self.driver.reset(done)

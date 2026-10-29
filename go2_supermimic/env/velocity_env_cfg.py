@@ -39,7 +39,7 @@ def titatit_velocity_env_cfg(play=False):
   from mjlab.utils.spec_config import CollisionCfg
   robot = cfg.scene.entities['robot']
   robot.collisions += (CollisionCfg(geom_names_expr=('(front|rear)_tita_base_.*',),
-    contype=1, conaffinity=1, condim=3, disable_other_geoms=False),)
+    contype=1, conaffinity=1, condim=3, priority=0, disable_other_geoms=False),)
   terms = cfg.observations['actor'].terms
   terms['velocity'] = terms.pop('target')
   terms['velocity'].params = {'command_name':'velocity'}
