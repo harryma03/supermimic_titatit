@@ -199,3 +199,108 @@ def test_trace_summary_reports_signed_response():
   assert result['velocity_mean'][1]==pytest.approx(.05)
   assert result['velocity_rmse'][1]==pytest.approx(.15)
   assert result['reset_count']==0
+
+
+def test_terrain_config_speed_and_explicit_transfer_contract(trainer):
+  from go2_supermimic.supermimic.train import validate_velocity_transfer
+  cfg=load_env_cfg('Titatit-Velocity-Terrain')
+  assert cfg.commands['velocity'].ranges[0]==(-1.5,1.5)
+  assert cfg.scene.terrain.max_init_terrain_level==0
+  assert sum(d for _,d in st.obs_terms(cfg))*5==670
+  assert set(cfg.scene.terrain.terrain_generator.sub_terrains)=={
+    'flat','stairs','stairs_inv','boxes','rough','slope','slope_inv','gap','climb'}
+  commands=sample_commands(cfg.commands['velocity'],20000,20000,'cpu')
+  assert (commands.abs()<=torch.tensor([1.5,.4,1.])).all()
+  assert (commands[:,0].abs()>1.4).any()
+  assert cfg.actions==load_env_cfg('Titatit-Velocity-Flat').actions
+  old=trainer.velocity_contract();new=copy.deepcopy(old)
+  new.update(version=3,terrain={})
+  new['terms']=list(new['terms'])+[('height_scan',77)]
+  new['command'].update(terrain=True,field_res=.04,cache_dir='logs/heightfields',ranges=cfg.commands['velocity'].ranges)
+  validate_velocity_transfer(old,new)
+  new['dt']=.01
+  with pytest.raises(ValueError,match='contract differs'):
+    validate_velocity_transfer(old,new)
+
+
+def test_real_terrain_transfer_scan_height_bptt_and_eval(trainer, monkeypatch, tmp_path):
+  from mjlab.tasks import registry
+  from go2_supermimic.target import terrain as tr
+  from go2_supermimic.env.velocity_env_cfg import velocity_terrain_boundary
+  flat_path=trainer.save(40000)
+  cfg=load_env_cfg('Titatit-Velocity-Terrain')
+  # Keep all nine real terrain types; shrink the map only for CPU integration.
+  cfg.scene.terrain.terrain_generator.num_rows=2
+  cfg.scene.terrain.terrain_generator.size=(4.,4.)
+  cfg.scene.terrain.terrain_generator.border_width=1.
+  cfg.commands['velocity'].field_res=.08
+  cfg.commands['velocity'].cache_dir=str(tmp_path/'heightfields')
+  original_load=registry.load_env_cfg
+  monkeypatch.setattr(registry,'load_env_cfg',lambda *a,**kw: copy.deepcopy(cfg))
+  train_cfg=TrainCfg(task='Titatit-Velocity-Terrain',device='cpu',num_envs=9,buffer_len=24,
+    wm_hidden=(32,32),actor_hidden=(32,),critic_hidden=(32,),wm_batch=4,wm_updates=1,
+    imag_batch=2,critic_epochs=1,critic_minibatches=1,archive_size=8,compile=False,
+    log_root=str(tmp_path),resume=str(flat_path),velocity_transfer=True,reset_critic=True)
+  t=Trainer(train_cfg)
+  try:
+    assert t.obs.shape==(9,670) and t.imag.critic_dim==223
+    assert t.start_it==0 and t.policy_start>=1500 and t.actor_frozen_until>=2000
+    assert t.field is t.term.height_field
+    # Adding the scan preserves the old actor's initial function exactly.
+    old_actor=trainer.actor
+    obs=torch.randn(9,285);extra=torch.randn(9,385)
+    torch.testing.assert_close(t.actor(torch.cat([obs,extra],-1)),old_actor(obs))
+    env=t.env;terrain=env.scene.terrain
+    assert terrain.terrain_origins.shape==(2,9,3)
+    assert not terrain.terrain_levels.any()
+    assert len(terrain.terrain_types.unique())==9
+    env.observation_manager.cfg['actor'].enable_corruption=False
+    for name in env.observation_manager.active_terms['actor']:
+      env.observation_manager.get_term_cfg('actor',name).noise=None
+    obs,_=env.reset();t.obs=obs['actor'];t.a_prev.zero_()
+    before=t.obs.clone();a=torch.zeros(9,16)
+    obs,_,_,_,_=env.step(a)
+    s=st.robot_state(env,t.field);pose=st.planar_pose(env)
+    d=env.scene['robot'].data
+    torch.testing.assert_close(s[:,0],d.root_link_pos_w[:,2]-tr.ground(pose[:,:2],t.field))
+    assert tr.ground(pose[:,:2],t.field).abs().max()>.01
+    scan=s[:,:1]+t.imag.relief(pose)
+    torch.testing.assert_close(scan,t.term.scan(),atol=1e-5,rtol=1e-5)
+    assert t.imag.relief(pose).abs().max()>.01
+    frame=observation_frame(s,a,t.term.command,t.enc_bias,height_scan=scan)
+    torch.testing.assert_close(obs['actor'],st.push_history(before,frame,5,t.terms),atol=1e-5,rtol=1e-5)
+    # Real rewards must use the same ground-relative height as replay.
+    measured=env._velocity_reward_state
+    torch.testing.assert_close(env._velocity_reward_values['height'],(measured[:,0]-.3622).square())
+    t.obs=obs['actor']
+    while t.buf.size<12:t.collect()
+    assert t.buf.relief.abs().max()>.01
+    assert torch.isfinite(torch.tensor(t.fit_world_model()))
+    t.it=2001
+    stats=t.improve_policy()
+    assert stats['actor_grad_norm']>0 and all(torch.isfinite(torch.tensor(v)) for v in stats.values())
+    # Height scan must retain gradients through the imagined pose.
+    pose=pose.detach().requires_grad_()
+    t.imag.scan(s,pose,True).sum().backward()
+    assert pose.grad is not None and torch.isfinite(pose.grad).all()
+    assert not velocity_terrain_boundary(env).any()
+    root=d.root_link_pose_w.clone();root[0,0]=env.scene.env_origins[0,0]+2.
+    env.scene['robot'].write_root_link_pose_to_sim(root);env.sim.forward();env.sim.sense()
+    assert velocity_terrain_boundary(env)[0]
+    env.common_step_counter=12000
+    env.reset()
+    assert terrain.terrain_levels.max()>0
+    path=t.save(1);t.load(str(path))
+    from scripts.export_actor import export
+    assert export(path,tmp_path/'terrain.onnx')['input']==[1,670]
+    # Exercise the real evaluator against the same saved terrain recipe.
+    import scripts.eval_velocity as ev
+    monkeypatch.setattr(ev,'load_env_cfg',lambda *a,**kw: copy.deepcopy(cfg))
+    from argparse import Namespace
+    report=ev.evaluate(Namespace(checkpoint=str(path),device='cpu',seed=0,num_envs=9,
+      width=320,height=240,suite=False,vx=1.5,vy=0.,yaw=0.,seconds=.04,
+      terrain_level=1,viewer=False,video=None,output=None,trace=None))
+    assert report['task']=='Titatit-Velocity-Terrain' and report['terrain_level']==1
+  finally:
+    t.writer.close();t.env.close()
+    monkeypatch.setattr(registry,'load_env_cfg',original_load)

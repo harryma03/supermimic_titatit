@@ -32,7 +32,16 @@ for task_id, kw in (
   )
 
 from go2_supermimic.env.velocity_env_cfg import titatit_velocity_env_cfg
+from go2_supermimic.env.depth_env_cfg import titatit_depth_env_cfg
+register_mjlab_task(
+  task_id="Titatit-Velocity-Depth", env_cfg=titatit_depth_env_cfg(),
+  play_env_cfg=titatit_depth_env_cfg(play=True), rl_cfg=RslRlOnPolicyRunnerCfg(),
+)
 register_mjlab_task(
   task_id="Titatit-Velocity-Flat", env_cfg=titatit_velocity_env_cfg(),
   play_env_cfg=titatit_velocity_env_cfg(play=True), rl_cfg=RslRlOnPolicyRunnerCfg(),
+)
+register_mjlab_task(
+  task_id="Titatit-Velocity-Terrain", env_cfg=titatit_velocity_env_cfg(terrain=True),
+  play_env_cfg=titatit_velocity_env_cfg(play=True, terrain=True), rl_cfg=RslRlOnPolicyRunnerCfg(),
 )

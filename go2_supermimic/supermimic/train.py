@@ -34,6 +34,8 @@ class TrainCfg:
   device: str = "cuda:0"
   velocity_sigma_lin: float = 0.0
   """0 keeps task default; positive values explicitly override tracking width."""
+  velocity_transfer: bool = False
+  """Explicit Flat -> Terrain warm start; requires a new curriculum and critic."""
   num_envs: int = 4096
   buffer_len: int = 1000
   iterations: int = 40_000
@@ -241,6 +243,23 @@ def validate_velocity_resume(old, new, reset_critic):
     raise ValueError("Changed velocity rewards require --reset-critic true")
 
 
+def validate_velocity_transfer(old, new):
+  """Only add a scan and change commands/rewards/ground; preserve robot semantics."""
+  import copy
+  if old is None or old.get('version') != 2 or new.get('version') != 3:
+    raise ValueError('Expected Flat v2 -> Terrain v3 velocity contracts')
+  left, right = copy.deepcopy(old), copy.deepcopy(new)
+  right['version'] = 2
+  right.pop('terrain', None)
+  right['terms'] = [t for t in right['terms'] if t[0] != 'height_scan']
+  for value in (left, right):
+    value['terms'] = [list(t) for t in value['terms']]
+    for key in ('rewards','ranges','terrain','field_res','cache_dir'):
+      value['command'].pop(key, None)
+  if left != right:
+    raise ValueError('Velocity transfer observation/dynamics contract differs')
+
+
 class Trainer:
   def __init__(self, cfg: TrainCfg):
     import go2_supermimic.env  # noqa: F401
@@ -248,6 +267,11 @@ class Trainer:
     from mjlab.tasks.registry import load_env_cfg
 
     self.cfg = cfg
+    if cfg.task == 'Titatit-Velocity-Depth' and type(self) is Trainer:
+      raise ValueError('Depth requires scripts/train_depth.py (perception and recurrent replay)')
+    if cfg.velocity_transfer and (cfg.task != 'Titatit-Velocity-Terrain' or not cfg.resume
+                                 or not cfg.reset_critic or cfg.continue_run):
+      raise ValueError('velocity-transfer requires Terrain, --resume, --reset-critic true and --continue-run false')
     torch.manual_seed(cfg.seed)
     env_cfg = load_env_cfg(cfg.task)
     env_cfg.scene.num_envs = cfg.num_envs
@@ -298,7 +322,7 @@ class Trainer:
                                for f in fields(RewardWeights) if f.name in env_cfg.rewards})
     imag_cfg = ImagineCfg(horizon=cfg.horizon, compile=cfg.compile, sensor_grad=cfg.sensor_grad,
                           weights=weights)
-    self.field = None if self.velocity else self.term.height_field
+    self.field = self.term.height_field
     self.terms = st.obs_terms(env_cfg)
     imag_cfg.dt = self.env.step_dt
     if self.velocity:
@@ -306,7 +330,8 @@ class Trainer:
       self.term.cfg.rewards.weights = {name: term.weight for name, term in env_cfg.rewards.items()}
       self.imag = VelocityImagination(imag_cfg, self.consts, self.term.cfg.rewards,
                                       self.history, self.terms,
-                                      noise=env_cfg.observations['actor'].enable_corruption)
+                                      noise=env_cfg.observations['actor'].enable_corruption,
+                                      field=self.field)
     else:
       self.imag = Imagination(imag_cfg, self.consts, self.term.cfg.target, self.history, self.dev,
                               self.terms, self.field)
@@ -358,9 +383,18 @@ class Trainer:
     return self.term.cfg.target.wheel_radius
 
   def velocity_contract(self):
-    return {'version': 2, 'trunk_contacts': True, 'state_dim': self.wm.state_dim, 'terms': self.terms,
+    command = asdict(self.term.cfg)
+    if not self.term.cfg.terrain:
+      for key in ('terrain','field_res','cache_dir'):
+        command.pop(key)
+    contract = {'version': 3 if self.term.cfg.terrain else 2,
+            'trunk_contacts': True, 'state_dim': self.wm.state_dim, 'terms': self.terms,
             'history': self.history, 'dt': self.env.step_dt,
-            'command': asdict(self.term.cfg)}
+            'command': command}
+    if self.term.cfg.terrain:
+      from go2_supermimic.env.terrains import velocity_terrain_contract
+      contract['terrain'] = velocity_terrain_contract(self.env_cfg.scene.terrain)
+    return contract
 
   def _velocity_curriculum(self, it):
     if it < self.term.cfg.stage_iterations[-1] or getattr(self.env, 'velocity_dr_enabled', False):
@@ -379,9 +413,16 @@ class Trainer:
 
   def load(self, path: str) -> None:
     ckpt = torch.load(path, map_location=self.dev, weights_only=False)
-    if self.velocity and ckpt['cfg']['task'] != self.cfg.task:
+    transfer = self.velocity and self.cfg.velocity_transfer and ckpt['cfg']['task'] != self.cfg.task
+    if transfer:
+      if ckpt['cfg']['task'] != 'Titatit-Velocity-Flat':
+        raise ValueError('velocity-transfer accepts Titatit-Velocity-Flat only')
+      validate_velocity_transfer(ckpt.get('velocity_contract'), self.velocity_contract())
+      self.policy_start = max(self.policy_start, self.cfg.wm_rewarmup_iterations)
+      print(f'Flat -> Terrain: fresh replay/optimizers/critic; WM-only until {self.policy_start}', flush=True)
+    elif self.velocity and ckpt['cfg']['task'] != self.cfg.task:
       raise ValueError("Velocity has augmented dynamics and new reward semantics: train from scratch; use same-task checkpoints only")
-    if self.velocity:
+    if self.velocity and not transfer:
       validate_velocity_resume(ckpt.get("velocity_contract"), self.velocity_contract(), self.cfg.reset_critic)
     wm_sd = self.wm.state_dict()
     same_wm = all(
@@ -389,7 +430,7 @@ class Trainer:
     )
     if same_wm:
       self.wm.load_state_dict(ckpt["world_model"])
-      if "opt_wm" in ckpt:
+      if "opt_wm" in ckpt and not transfer:
         self.opt_wm.load_state_dict(ckpt["opt_wm"])
     elif expand_world_model_scan(ckpt["world_model"], self.wm):
       print("world model: ground-scan inputs added (zero weight, same predictions)", flush=True)
@@ -404,7 +445,7 @@ class Trainer:
     new_obs_dim = self.obs.shape[-1]
     if old_obs_dim == new_obs_dim:
       self.actor.load_state_dict(ckpt["actor"])
-      if "opt_actor" in ckpt:
+      if "opt_actor" in ckpt and not transfer:
         self.opt_actor.load_state_dict(ckpt["opt_actor"])
     elif "height_scan" in dict(self.terms) and new_obs_dim == old_obs_dim + self.history * dict(
       self.terms
@@ -520,8 +561,12 @@ class Trainer:
   def _rarity(self, w: dict[str, torch.Tensor]) -> torch.Tensor:
     """Contact changes + flight steps + an early episode end (a fall) per window."""
     s = w["s"][:, :, :st.StateLayout(self.num_actions).state_dim]
-    contact = st.feet_world_z(s.reshape(-1, s.shape[-1]), self.wheel_radius) < 0.035
-    contact = contact.reshape(s.shape[0], -1, 4).float()
+    if self.velocity:
+      from go2_supermimic.supermimic.velocity import CONTACT
+      contact = w['s'][:, :, CONTACT].clamp(0, 1)
+    else:
+      contact = st.feet_world_z(s.reshape(-1, s.shape[-1]), self.wheel_radius) < 0.035
+      contact = contact.reshape(s.shape[0], -1, 4).float()
     changes = (contact[:, 1:] - contact[:, :-1]).abs().sum((1, 2))
     airborne = (contact.sum(-1) == 0).float().sum(-1)
     ended = (w["valid"][:, -1] < 0.5).float() * 4.0
@@ -531,8 +576,12 @@ class Trainer:
     """Genuinely rare windows: a flight phase (all feet off for >= 2 steps), a
     hard vertical base motion (take-off / landing impact) or a fall."""
     s = w["s"][:, :, :st.StateLayout(self.num_actions).state_dim]
-    feet_z = st.feet_world_z(s.reshape(-1, s.shape[-1]), self.wheel_radius).reshape(s.shape[0], -1, 4)
-    flight = ((feet_z >= 0.035).all(-1).float().sum(-1)) >= 2
+    if self.velocity:
+      from go2_supermimic.supermimic.velocity import CONTACT
+      flight = (w['s'][:, :, CONTACT].sum(-1) < .5).sum(-1) >= 2
+    else:
+      feet_z = st.feet_world_z(s.reshape(-1, s.shape[-1]), self.wheel_radius).reshape(s.shape[0], -1, 4)
+      flight = ((feet_z >= 0.035).all(-1).float().sum(-1)) >= 2
     hard_vz = s[:, :, st.V_YAW][..., 2].abs().amax(-1) > 0.6
     fell = w["valid"][:, -1] < 0.5
     return flight | hard_vz | fell
@@ -579,18 +628,25 @@ class Trainer:
 
   # Phase 3.
 
-  def improve_policy(self) -> dict[str, float]:
+  def policy_seed(self):
     cfg, b = self.cfg, self.buf
     env, t = b.sample_states(cfg.imag_batch)
-    seed = {
+    return {
       "env": env, "s": b.s[env, t], "pose": b.pose[env, t], "a_prev": b.a_prev[env, t],
       "obs": b.obs[env, t].float(), "gen": b.gen[env, t], "xi": b.xi[env, t],
       "command": b.command[env, t],
       "enc_bias": b.enc_bias[env, t],
     }
-    self.opt_wm.zero_grad(set_to_none=True)
-    for p in self.wm.parameters():
-      p.requires_grad_(False)
+
+  def policy_models(self):
+    return (self.wm,)
+
+  def improve_policy(self) -> dict[str, float]:
+    cfg = self.cfg
+    seed = self.policy_seed()
+    for model in self.policy_models():
+      model.zero_grad(set_to_none=True)
+      model.requires_grad_(False)
     hint = cfg.dodge_shaping * max(0.0, 1.0 - self.it / max(1, cfg.dodge_shaping_decay_iterations))
     objective, data = self.imag.rollout(self.wm, self.actor, self.critic, seed, hint)
     loss = -objective.mean()
@@ -602,8 +658,8 @@ class Trainer:
       self.nonfinite_steps += 1
     if self.it > self.actor_frozen_until and finite:
       self.opt_actor.step()
-    for p in self.wm.parameters():
-      p.requires_grad_(True)
+    for model in self.policy_models():
+      model.requires_grad_(True)
 
     # Critic on the imagined transitions.
     targets = self.imag.gae_targets(self.critic, data)
@@ -632,6 +688,9 @@ class Trainer:
       "critic_loss": sum(c_losses) / len(c_losses),
     }
 
+  def checkpoint_extra(self):
+    return {}
+
   def save(self, it: int) -> Path:
     path = self.log_dir / f"model_{it}.pt"
     torch.save(
@@ -648,6 +707,7 @@ class Trainer:
         "obs_dim": self.obs.shape[-1],
         "act_dim": self.num_actions,
         "velocity_contract": self.velocity_contract() if self.velocity else None,
+        **self.checkpoint_extra(),
       },
       path,
     )
@@ -733,9 +793,9 @@ class Trainer:
             f"lr scale {self.lr_scale:.3g}", flush=True)
 
 
-def main() -> None:
+def main(config_type=TrainCfg, trainer_type=Trainer) -> None:
   ap = argparse.ArgumentParser()
-  defaults = TrainCfg()
+  defaults = config_type()
   for name, val in asdict(defaults).items():
     if isinstance(val, tuple):
       ap.add_argument(f"--{name.replace('_', '-')}", type=int, nargs="+", default=list(val))
@@ -745,8 +805,8 @@ def main() -> None:
     else:
       ap.add_argument(f"--{name.replace('_', '-')}", type=type(val), default=val)
   args = vars(ap.parse_args())
-  cfg = TrainCfg(**{k: tuple(v) if isinstance(v, list) else v for k, v in args.items()})
-  Trainer(cfg).run()
+  cfg = config_type(**{k: tuple(v) if isinstance(v, list) else v for k, v in args.items()})
+  trainer_type(cfg).run()
 
 
 if __name__ == "__main__":

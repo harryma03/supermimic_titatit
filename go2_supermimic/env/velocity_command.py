@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 import torch
 from mjlab.managers.command_manager import CommandTerm, CommandTermCfg
 from go2_supermimic.supermimic.velocity import VelocityRewards
+from go2_supermimic.target import terrain as tr
 
 
 @dataclass(kw_only=True)
@@ -14,6 +15,9 @@ class VelocityCommandCfg(CommandTermCfg):
   stage_iterations: tuple[int,...] = (0, 3000, 6000, 10000, 15000)
   rewards: VelocityRewards = field(default_factory=VelocityRewards)
   fixed_command: tuple[float,float,float] | None = None
+  terrain: bool = False
+  field_res: float = 0.04
+  cache_dir: str = 'logs/heightfields'
 
   def __post_init__(self):
     if len(self.ranges)!=3 or any(lo>hi for lo,hi in self.ranges):
@@ -52,6 +56,18 @@ class VelocityCommand(CommandTerm):
     super().__init__(cfg,env)
     self._command = torch.zeros(self.num_envs,3,device=self.device)
     self.iteration = 0
+    self.robot = env.scene['robot']
+    self.height_field = None
+    if cfg.terrain:
+      exclude = {int(g) for g in self.robot.indexing.geom_ids}
+      half = max(env.cfg.scene.terrain.terrain_generator.size) / 2 + 1.5
+      self.height_field = tr.env_height_field(env, exclude, half, cfg.field_res, cfg.cache_dir)
+
+  def scan(self):
+    d = self.robot.data
+    xy = d.root_link_pos_w[:, :2]
+    height = d.root_link_pos_w[:, 2:3] - tr.ground(xy, self.height_field)[:, None]
+    return height + tr.relief(xy, d.heading_w, self.height_field)
 
   @property
   def command(self): return self._command

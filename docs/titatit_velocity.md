@@ -1,6 +1,54 @@
 # TITATIT 三维遥控速度跟踪（SuperMimic）
 
+视觉感知版本：[`Titatit-Velocity-Depth`（WMP 感知 + SuperMimic）](titatit_depth.md)，使用独立的 `scripts/train_depth.py`。
+
 新增任务 `Titatit-Velocity-Flat`，与原有 Go2/TITATIT Chase Flat、Obstacles、Terrain 独立注册。使用在线仿真数据，不需要专家示范；算法仍是 World Model + 可微想象 + BPTT + TD(lambda) Critic，未引入 PPO。注册表中的 RSL-RL 配置只是 mjlab 注册接口所需，不用于 `scripts/train.py`。
+
+## 1.5 m/s 混合地形训练（2026-10-30）
+
+新增独立任务 `Titatit-Velocity-Terrain`，保留原 Flat 任务、机器人模型、PD、动作比例和力矩限制。这里“全地形”指配置中的九类混合地形，不表示任意障碍均可通过，也不表示训练后已能以 1.5 m/s 通过所有台阶。
+
+- 速度入口：`go2_supermimic/env/velocity_env_cfg.py` 的 `terrain` 分支。最终范围为纵向 **±1.5 m/s**、横向 **±0.4 m/s**、转向 **±1 rad/s**。每类地形使用相同最终指令范围。
+- 地形入口：`go2_supermimic/env/terrains.py` 的 `ROUGH_TERRAINS`，包含平地、上台阶、下台阶、随机方块、随机起伏、正/反坡面。台阶高度 2–10 cm、踏面 40 cm；方块高度参数 2–5 cm；起伏 1–4 cm；坡度参数 0–0.3。mjlab curriculum 模式为每种地形生成一列，不按 `proportion` 分配列数；这里有 5 行 × 9 类、每块 12×12 m。
+- 环境从第 0 行开始，`--terrain-curriculum-iterations 20000` 表示逐步开放更难地形，到 16000 次迭代开放第 4 行；reset 时从已开放行随机选择，持续保留简单地形。机器人离开分配地块中心 ±5.5 m 时按 timeout 重置，防止长期跑离训练区域。
+- 指令课程沿用阶段 0/3000/6000/10000/15000：纵向上限依次为 0.375/0.75/0.75/1.5/1.5 m/s，逐步加入倒车、横移、旋转和组合。15000 次迭代后加入原有摩擦/COM 随机化。
+- 实际奖励和 Replay 的站高均相对脚下地面；World Model 每步接收地形 relief，Actor 和 Critic 加入相同地形扫描。Actor 为 **670→16**（134 维单帧 × 5 帧，term-major），Critic 输入 223，WM 仍为 236→126。Actor 导出后也需要外部提供 77 点高度扫描，不能继续用旧 285 维部署接口。
+- 为允许越阶动作，新任务中 height/vertical_speed/leg_deviation/contact_change 权重分别为 -3/-0.1/-0.03/-0.005；其他奖励保持原值。这是初始训练配置，尚无长训通过率证明。
+
+推荐从现有 40000 轮平地模型迁移，在仓库根目录执行（CUDA 可用且所选 GPU 空闲时）：
+
+```bash
+CUDA_VISIBLE_DEVICES=1 /home/yons/anaconda3/envs/mjlab/bin/python scripts/train.py --task Titatit-Velocity-Terrain --num-envs 1024 --compile false --resume logs/supermimic/2026-10-29_16-53-35_titatit_velocity_resume/model_40000.pt --velocity-transfer true --reset-critic true --continue-run false --wm-rewarmup-iterations 1500 --critic-warmup-iterations 500 --actor-lr-scale 0.25 --actor-ramp-iterations 2000 --terrain-curriculum-iterations 20000 --iterations 40000 --run-name titatit_velocity_terrain_1p5
+```
+
+迁移会复用 Actor/WM 权重，扫描新增输入权重置零，保留原 Actor 初始输出；重新建立 Replay、优化器和 Critic。从新任务第 0 轮开始：前 1500 次迭代只学习 WM，随后预热 Critic 500 次迭代，再逐步启动 Actor。`--velocity-transfer true` 仅允许 Flat v2 → Terrain v3，且必须 `--reset-critic true --continue-run false`；不接受 Chase 模型。Terrain v3 合同保存有效地形参数，后续直接改地图参数会拒绝同任务续训。
+
+若从头训练，使用相同任务，删除 `--resume` 和 `--velocity-transfer`；无需平地模型。若是同一个 Terrain run 中断后续训，使用新地形 checkpoint，去掉迁移标记并恢复计数：
+
+```bash
+CUDA_VISIBLE_DEVICES=1 /home/yons/anaconda3/envs/mjlab/bin/python scripts/train.py --task Titatit-Velocity-Terrain --num-envs 1024 --compile false --resume /absolute/path/terrain_run/model_10000.pt --continue-run true --reset-critic false --actor-lr-scale 0.25 --actor-ramp-iterations 2000 --terrain-curriculum-iterations 20000 --iterations 40000 --run-name titatit_velocity_terrain_resume
+```
+
+评估器自动按 checkpoint 选择平地/地形任务；`--terrain-level` 固定难度行 0–4。九个环境可以覆盖九类地形；下面检验最高难度的 1.5 m/s 前进指令，报告整体跟踪、滑移和摔倒指标。需分别评估各行、正负速度及停止，不能仅看整体 reward 判断成功：
+
+```bash
+CUDA_VISIBLE_DEVICES=1 /home/yons/anaconda3/envs/mjlab/bin/python scripts/eval_velocity.py --checkpoint /absolute/path/terrain_run/model_40000.pt --terrain-level 4 --vx 1.5 --num-envs 9 --seconds 30 --output terrain_level4_vx1p5.json
+```
+
+
+### 新增 gap / climb（2026-10-30）
+
+Velocity-Terrain 和 Velocity-Depth 现在默认使用九类地形；Chase 保留原七类地图。新增两条横贯地块的沟壑或高台，中央保留 1.5 m 平地出生区，正反向均可接近障碍。
+
+- `gap`：沟宽随难度由 10 cm 增至 40 cm，沟底深 60 cm；使用真实碰撞几何和有限沟底，深度射线与高度扫描均能读取。它不是 WMP 的无底窄桥地图。
+- `climb`：高台高度由 5 cm 增至 25 cm，台面沿前进方向宽 80 cm，区别于连续台阶。
+- 参数见 `go2_supermimic/env/terrains.py` 的 `GapClimbTerrainCfg`。最终几何随地形生成器的难度采样变化。
+- 正在运行的旧训练继续使用内存中的旧地图。旧七类 Terrain / Depth checkpoint 与新地图合同不同，不能直接续训或用新配置评估；旧模型评估需保留原配置/代码。新地图可使用上面的平地模型迁移命令，建议换新 run-name（例如 `titatit_depth_gap_climb_1p5`）。不要绕过合同检查。
+- 九类地形评估使用 `--num-envs 9`。沟底落地不能仅凭“未倾倒”算作成功；还需检查是否跨过沟壑、登上并离开高台。当前奖励和倾倒判定沿用原任务，尚未加入专门的越沟成功率统计。
+
+当前验证覆盖 CPU 实际生成地形、观测/奖励/Replay 对齐、平地迁移、8 步 WM、32 步 BPTT、Critic、保存/加载、地形评估和 ONNX 导出；GPU 长训及 1.5 m/s 台阶通过能力另需验证。
+
+本次全仓库测试为 `51 passed`。此外使用真实 `2026-10-29_16-53-35_titatit_velocity_resume/model_40000.pt`、默认完整 5×7 地图和默认网络，在 CPU 上完成 7 环境采集、WM 更新、32 步 BPTT/Critic 更新及 checkpoint 保存，输入为 `(7,670)`，高度场为 `(2175,1575)`，loss 与梯度有限。集成回归测试使用缩小地图但保留全部七类地形。这些短程验证不代表策略已学会复杂地形。
 
 ## 文件与调用链
 
@@ -18,6 +66,8 @@
 上述相对代码路径均位于 `go2_supermimic/` 下，`scripts/`、`tests/` 除外。原 `scripts/eval.py` 继续评估 Chase。
 
 ## 机器人与网络
+
+以下网络维度与课程描述针对原 `Titatit-Velocity-Flat`；新 Terrain 任务的差异和命令见上节。
 
 控制顺序不变：FR、FL、RR、RL 各 hip/thigh/calf 共 12 项，最后 FR/FL/RR/RL foot 共 4 项。腿位置 PD 为 Kp=60、Kd=1.5，hip scale=0.125，thigh/calf scale=0.25；轮速度目标为 action×5 rad/s，轮 Kp=0、Kd=0.5。腿/轮力矩分别限幅 ±55/±10 Nm。物理步长 0.005 s，decimation=4，策略周期 0.02 s。
 
@@ -39,7 +89,7 @@ World Model 原机器人核心状态仍为 78 维；Velocity 追加 45 维：四
 
 Critic 输入 146 = 状态123 + command3 + previous action16 + context4。旧 TITATIT Chase Actor 410/490/795 和 World Model 191→81 均不变。
 
-**禁止将旧 Chase checkpoint 强行加载到 Velocity**：扩展动力学语义与形状不同，Actor/Critic 也不兼容。新任务从头训练；只接受相同任务、相同配置合同的续训 checkpoint。合同版本 2 包含有效机身碰撞、状态维度、观测项、历史长度、dt 和指令/奖励配置。
+**禁止将旧 Chase checkpoint 强行加载到 Velocity**：扩展动力学语义与形状不同，Actor/Critic 也不兼容。常规续训只接受相同任务、相同配置合同的 checkpoint；Flat → Terrain 必须使用上节的显式迁移入口。平地合同版本 2 包含有效机身碰撞、状态维度、观测项、历史长度、dt 和指令/奖励配置；地形版本 3 另保存有效地形参数。
 
 ## 坐标与 ROS 2 接口
 

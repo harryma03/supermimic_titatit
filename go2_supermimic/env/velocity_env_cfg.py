@@ -17,7 +17,7 @@ def velocity_reward(env, name):
   # All reward terms see one snapshot before command resampling and auto reset.
   key = env.common_step_counter
   if getattr(env, '_velocity_reward_step', None) != key:
-    s = st.robot_state(env)
+    s = st.robot_state(env, env.command_manager.get_term('velocity').height_field)
     prev = getattr(env, '_velocity_reward_state', s)
     prev = torch.where((env.episode_length_buf <= 1)[:,None], s, prev)
     c = getattr(env, '_velocity_consts', None)
@@ -31,7 +31,7 @@ def velocity_reward(env, name):
   return env._velocity_reward_values[name]
 
 
-def titatit_velocity_env_cfg(play=False):
+def titatit_velocity_env_cfg(play=False, terrain=False):
   cfg = titatit_chase_env_cfg(play=play)
   cfg.commands = {'velocity': VelocityCommandCfg()}
   # Re-enable the existing MJCF trunk boxes: the inherited wheel-only
@@ -46,6 +46,29 @@ def titatit_velocity_env_cfg(play=False):
   terms['joint_pos'].func = masked_joint_positions
   # Mask unused wheel position slots after corruption through a dedicated term.
   terms['joint_pos'].noise = None
+  if terrain:
+    # Full mixed maps can exceed the inherited 300 constraints before reset.
+    cfg.sim.njmax = 1024
+    from mjlab.managers.observation_manager import ObservationTermCfg
+    from mjlab.managers.curriculum_manager import CurriculumTermCfg
+    from mjlab.managers.termination_manager import TerminationTermCfg
+    from mjlab.utils.noise import UniformNoiseCfg
+    from go2_supermimic.env import mdp
+    from go2_supermimic.env.terrains import rough_terrain
+    cfg.scene.terrain = rough_terrain(gap_climb=True)
+    cfg.scene.terrain.max_init_terrain_level = 0
+    command = cfg.commands['velocity']
+    command.terrain = True
+    command.ranges = ((-1.5,1.5),(-.4,.4),(-1.,1.))
+    # Permit leg articulation and vertical motion while crossing step edges.
+    command.rewards.weights.update(height=-3., vertical_speed=-.1,
+                                   leg_deviation=-.03, contact_change=-.005)
+    terms['height_scan'] = ObservationTermCfg(func=mdp.height_scan,
+      params={'command_name':'velocity'}, noise=UniformNoiseCfg(n_min=-.02,n_max=.02))
+    cfg.curriculum['terrain_levels'] = CurriculumTermCfg(
+      func=mdp.terrain_levels_by_progress, params={'steps':12000})
+    cfg.terminations['terrain_boundary'] = TerminationTermCfg(
+      func=velocity_terrain_boundary, time_out=True)
   cfg.rewards = {name: RewardTermCfg(func=velocity_reward,weight=w,params={'name':name})
                  for name,w in cfg.commands['velocity'].rewards.weights.items()}
   cfg.metrics = {}
@@ -70,6 +93,13 @@ def titatit_velocity_env_cfg(play=False):
   cfg.events['reset_robot_joints'].params['position_range'] = (0.,0.)
   cfg.events['reset_robot_joints'].params['velocity_range'] = (0.,0.)
   return cfg
+
+
+def velocity_terrain_boundary(env):
+  # Reset before leaving the assigned tile, keeping all terrain types in replay.
+  size = env.cfg.scene.terrain.terrain_generator.size
+  xy = env.scene['robot'].data.root_link_pos_w[:, :2] - env.scene.env_origins[:, :2]
+  return (xy.abs() > xy.new_tensor(size) / 2 - .5).any(-1)
 
 # Called once at the explicit robustness stage; the decorator prepares expanded
 # model fields at env construction even before randomization is enabled.

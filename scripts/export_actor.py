@@ -11,7 +11,7 @@ def export(checkpoint, output):
   import onnx
   from onnx.reference import ReferenceEvaluator
   ckpt=torch.load(checkpoint,map_location='cpu',weights_only=False)
-  if ckpt['cfg']['task'] != 'Titatit-Velocity-Flat' or not ckpt.get('velocity_contract'):
+  if ckpt['cfg']['task'] not in ('Titatit-Velocity-Flat','Titatit-Velocity-Terrain') or not ckpt.get('velocity_contract'):
     raise ValueError('Expected a velocity checkpoint with an observation contract')
   actor=Actor(ckpt['obs_dim'],tuple(ckpt['cfg']['actor_hidden']),ckpt['act_dim']).eval()
   actor.load_state_dict(ckpt['actor'])

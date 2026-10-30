@@ -2,7 +2,7 @@
 
 Auxiliary dynamics are measured in simulation and predicted by the world model.
 Slip is the material velocity at the strongest wheel/ground contact, not axle
-velocity or a wheel-speed mismatch. Flat stationary ground only.
+velocity or a wheel-speed mismatch. Assumes stationary ground.
 """
 from dataclasses import dataclass, field
 import math
@@ -73,11 +73,13 @@ def reward_terms(s0, s, a, previous, commands, default_q, limits, cfg):
   }
 
 
-def observation_frame(s, previous, commands, bias, noise=False):
-  frame = st.obs_frame(s[:, :CORE_DIM], previous, commands, bias, noise=False, command_name="velocity")
+def observation_frame(s, previous, commands, bias, noise=False, height_scan=None):
+  frame = st.obs_frame(s[:, :CORE_DIM], previous, commands, bias, noise=False,
+                       command_name="velocity", height_scan=height_scan)
   if noise:
-    for name in ('base_ang_vel','projected_gravity','joint_vel'):
-      frame[name] = frame[name] + (2*torch.rand_like(frame[name])-1)*st.OBS_NOISE[name]
+    for name in ('base_ang_vel','projected_gravity','joint_vel','height_scan'):
+      if name in frame:
+        frame[name] = frame[name] + (2*torch.rand_like(frame[name])-1)*st.OBS_NOISE[name]
   # Continuous wheel angles AND encoder/noise on those unused slots are masked.
   frame['joint_pos'] = torch.cat([frame['joint_pos'][:, :12], torch.zeros_like(previous[:, 12:])], -1)
   return frame

@@ -12,7 +12,6 @@ from go2_supermimic.supermimic.world_model import WorldModel
 from go2_supermimic.supermimic.imagine import ImagineCfg
 from go2_supermimic.supermimic.velocity_imagine import VelocityImagination
 from go2_supermimic.supermimic.velocity import EXTRA_DIM, SLIP, CONTACT, vertical_yaw_rate
-from go2_supermimic.target.terrain import SCAN_POINTS
 
 SUITE = [(0.,0.,0.),(.5,0.,0.),(-.5,0.,0.),(0.,.25,0.),(0.,-.25,0.),
          (0.,0.,.8),(0.,0.,-.8),(.5,0.,.5),(0.,.2,.5),(0.,0.,0.)]
@@ -34,15 +33,21 @@ def summarize_trace(rows):
 
 def evaluate(args):
   ckpt=torch.load(args.checkpoint,map_location=args.device,weights_only=False)
-  if ckpt['cfg']['task'] != 'Titatit-Velocity-Flat':
-    raise ValueError('Use a Titatit-Velocity-Flat checkpoint')
-  cfg=load_env_cfg('Titatit-Velocity-Flat',play=True)
+  task=ckpt['cfg']['task']
+  if task not in ('Titatit-Velocity-Flat','Titatit-Velocity-Terrain'):
+    raise ValueError('Use a TITATIT velocity checkpoint')
+  cfg=load_env_cfg(task,play=True)
   contract=ckpt.get('velocity_contract')
-  if contract is None or contract.get('version')!=2:
-    raise ValueError('Expected velocity contract version 2 (active trunk contacts)')
+  if contract is None or contract.get('version')!=(3 if task.endswith('Terrain') else 2):
+    raise ValueError('Expected velocity contract v2 (Flat) or v3 (Terrain)')
   # Evaluate the checkpoint's reward scales, rather than silently using new ones.
   from go2_supermimic.supermimic.velocity import VelocityRewards
   cfg.commands['velocity'].rewards=VelocityRewards(**contract['command']['rewards'])
+  if cfg.commands['velocity'].terrain:
+    cfg.commands['velocity'].field_res=contract['command']['field_res']
+    cfg.curriculum={}
+    if not 0 <= args.terrain_level < cfg.scene.terrain.terrain_generator.num_rows:
+      raise ValueError('terrain-level must be between 0 and 4')
   for name, reward in cfg.rewards.items():
     reward.weight=cfg.commands['velocity'].rewards.weights[name]
   cfg.seed=args.seed
@@ -52,6 +57,13 @@ def evaluate(args):
   schedule=SUITE if args.suite else [(args.vx,args.vy,args.yaw)]
   cfg.commands['velocity'].fixed_command=schedule[0]
   env=ManagerBasedRlEnv(cfg,device=args.device,render_mode='rgb_array' if args.video else None)
+  if cfg.commands['velocity'].terrain:
+    from go2_supermimic.env.terrains import velocity_terrain_contract
+    if json.loads(json.dumps(velocity_terrain_contract(cfg.scene.terrain))) != json.loads(json.dumps(contract['terrain'])):
+      raise ValueError('Terrain recipe differs from checkpoint')
+    terrain=env.scene.terrain
+    terrain.terrain_levels.fill_(args.terrain_level)
+    terrain.env_origins[:]=terrain.terrain_origins[terrain.terrain_levels,terrain.terrain_types]
   obs,_=env.reset();hist=obs['actor'];term=env.command_manager.get_term('velocity')
   c=st.robot_consts(env);ctx=st.ContextReader(env);xi=ctx.read()
   bias=env.scene['robot'].data.encoder_bias[:,st.action_joint_ids(env)]*c.position_mask
@@ -59,7 +71,8 @@ def evaluate(args):
   actor.load_state_dict(ckpt['actor'])
   wm=WorldModel(tuple(ckpt['cfg']['wm_hidden']),16,EXTRA_DIM).to(args.device).eval()
   wm.load_state_dict(ckpt['world_model'])
-  imag=VelocityImagination(ImagineCfg(horizon=32,dt=env.step_dt),c,term.cfg.rewards,5,st.obs_terms(cfg),noise=False)
+  imag=VelocityImagination(ImagineCfg(horizon=32,dt=env.step_dt),c,term.cfg.rewards,5,
+                           st.obs_terms(cfg),noise=False,field=term.height_field)
   critic=Critic(imag.critic_dim,tuple(ckpt['cfg']['critic_hidden'])).to(args.device).eval()
   critic.load_state_dict(ckpt['critic'])
   if args.viewer:
@@ -82,7 +95,7 @@ def evaluate(args):
       phase_trace=[]
       phase_steps=max(1,round(args.seconds/env.step_dt))
       for step in range(phase_steps):
-        s=st.robot_state(env);pose=st.planar_pose(env)
+        s=st.robot_state(env,term.height_field);pose=st.planar_pose(env)
         if pred is None or window_step == 32:
           seed=dict(s=s,pose=pose,a_prev=previous,obs=hist,command=term.command.clone(),
                     xi=xi,enc_bias=bias,env=torch.arange(env.num_envs,device=env.device))
@@ -91,7 +104,7 @@ def evaluate(args):
           pred=s.clone();pred_pose=pose.clone();alive=torch.ones(env.num_envs,dtype=torch.bool,device=env.device)
           window_return=torch.zeros(env.num_envs,device=env.device);window_step=0
         action=actor(hist)
-        pred,delta=wm(pred,action,previous,xi,s.new_zeros(env.num_envs,SCAN_POINTS))
+        pred,delta=wm(pred,action,previous,xi,imag.relief(pred_pose))
         pred_pose=st.apply_pose_delta(pred_pose,delta)
         executed_command=term.command.clone()
         # Commands update after reward, before observation/history construction.
@@ -99,7 +112,7 @@ def evaluate(args):
           term.cfg.fixed_command=schedule[phase+1]
         obs,reward,done,timeout,_=env.step(action)
         # auto_reset=False: read terminal state, never substitute reset posture.
-        sn=st.robot_state(env)
+        sn=st.robot_state(env,term.height_field)
         add('lin_sq',(sn[:,4:6]-executed_command[:,:2]).square().sum(-1))
         add('yaw_sq',(vertical_yaw_rate(sn)-executed_command[:,2]).square())
         add('height',sn[:,0])
@@ -167,7 +180,8 @@ def evaluate(args):
     'imagined_32step_bootstrapped_return_mean':float(torch.cat(imagined).mean()),
     'world_model_open_loop_errors':{h:({k:sum(r[k] for r in rows)/len(rows) for k in rows[0]} if rows else None)
                                     for h,rows in horizon_errors.items()},
-    'phases':phase_stats,'device':args.device,
+    'phases':phase_stats,'device':args.device,'task':task,
+    'terrain_level':args.terrain_level if term.cfg.terrain else None,
     'note':'Actual total and imagined bootstrapped return use different horizons; neither is a convergence certificate.',
   }
   print(json.dumps(report,indent=2))
@@ -186,6 +200,7 @@ def main():
   p.add_argument('--num-envs',type=int,default=64);p.add_argument('--seconds',type=float,default=10.,help='Seconds per suite phase')
   p.add_argument('--device',default='cuda:0');p.add_argument('--suite',action='store_true')
   p.add_argument('--seed',type=int,default=0);p.add_argument('--trace',help='Save aligned per-step tensors to a .pt file')
+  p.add_argument('--terrain-level',type=int,default=0,help='Terrain difficulty row, 0 (easy) to 4 (hard)')
   p.add_argument('--viewer',action='store_true');p.add_argument('--video');p.add_argument('--output')
   p.add_argument('--width',type=int,default=1280);p.add_argument('--height',type=int,default=720)
   args=p.parse_args()
